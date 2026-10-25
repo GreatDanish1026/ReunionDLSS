@@ -203,7 +203,17 @@ struct ListLog {
     uint32_t draws = 0;    // consecutive draws not yet written
 };
 
+// TSR's compute shaders in this game build (stable across runs; docs/FINDINGS.md), in order.
+const uint32_t kTsrShaders[] = {0xed32101f, 0xdb4a2625, 0xabcfcc34, 0x19a32eda, 0xd235f807, 0x60acc0c7};
+
+bool IsTsr(uint32_t id) {
+    for (uint32_t t : kTsrShaders)
+        if (t == id) return true;
+    return false;
+}
+
 std::mutex g_capMutex;
+std::unordered_map<uint64_t, uint32_t> g_listPipe;  // command list -> compute shader id bound now
 std::unordered_map<uint64_t, ListLog> g_lists;  // command list -> events since its reset
 std::vector<std::string> g_frame;                // executed lists in order, with frame boundaries
 std::unordered_map<uint64_t, uint64_t> g_listIds;
@@ -270,7 +280,12 @@ void OnBarrier(command_list* cl, uint32_t count, const resource* res, const reso
 void OnBindPipeline(command_list* cl, pipeline_stage stages, pipeline pipe) {
     if (!Recording()) return;
     if ((stages & pipeline_stage::compute_shader) == 0) return;
-    Add(cl, Format("compute pipeline cs%08x", PipeId(pipe)));
+    const uint32_t id = PipeId(pipe);
+    {
+        std::lock_guard<std::mutex> lock(g_capMutex);
+        g_listPipe[cl->get_native()] = id;
+    }
+    Add(cl, Format("compute pipeline cs%08x%s", id, IsTsr(id) ? " (TSR)" : ""));
 }
 
 bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
@@ -299,9 +314,47 @@ bool OnExecuteIndirect(command_list* cl, indirect_command type, resource, uint64
     return false;
 }
 
+// Writes a constant buffer's contents (as 32-bit values: float, and hex where it isn't a plain
+// float) to the list log. TSR passes only; the View uniform buffer is large, so up to 8 KB.
+void DumpConstants(command_list* cl, uint32_t param, const buffer_range& b) {
+    device* dev = cl->get_device();
+    const resource_desc d = dev->get_resource_desc(b.buffer);
+    if (d.type != resource_type::buffer || b.offset >= d.buffer.size) return;
+    uint64_t size = d.buffer.size - b.offset;
+    if (b.size != UINT64_MAX && b.size < size) size = b.size;
+    if (size > 8192) size = 8192;
+    void* data = nullptr;
+    if (!dev->map_buffer_region(b.buffer, b.offset, size, map_access::read_only, &data) || !data) {
+        Add(cl, Format("constants param %u: can't read (heap %u)", param, static_cast<uint32_t>(d.heap)));
+        return;
+    }
+    std::vector<uint32_t> v(static_cast<size_t>(size / 4));
+    memcpy(v.data(), data, v.size() * 4);
+    dev->unmap_buffer_region(b.buffer);
+    Add(cl, Format("constants param %u: %zu bytes", param, v.size() * 4));
+    for (size_t i = 0; i < v.size(); i += 4) {
+        std::string line = Format("  c %4zu:", i * 4);
+        for (size_t k = i; k < i + 4 && k < v.size(); ++k) {
+            float f;
+            memcpy(&f, &v[k], 4);
+            const uint32_t e = (v[k] >> 23) & 0xff;
+            if (v[k] == 0) line += "          0";
+            else if (e > 90 && e < 165) line += Format(" %10.6g", f);  // a plausible float
+            else line += Format("  0x%08x", v[k]);
+        }
+        Add(cl, line);
+    }
+}
+
 void OnPushDescriptors(command_list* cl, shader_stage stages, pipeline_layout, uint32_t param, const descriptor_table_update& u) {
     if (!Recording()) return;
     device* dev = cl->get_device();
+    bool tsr = false;
+    if ((stages & shader_stage::compute) != 0 && u.type == descriptor_type::constant_buffer) {
+        std::lock_guard<std::mutex> lock(g_capMutex);
+        auto it = g_listPipe.find(cl->get_native());
+        tsr = it != g_listPipe.end() && IsTsr(it->second);
+    }
     const char* st = (stages & shader_stage::compute) != 0 ? "cs" : "gfx";
     std::string s = Format("push %s param %u at %u:", st, param, u.binding);
     for (uint32_t i = 0; i < u.count && i < 16; ++i) {
@@ -331,6 +384,9 @@ void OnPushDescriptors(command_list* cl, shader_stage stages, pipeline_layout, u
         }
     }
     Add(cl, s);
+    if (tsr)
+        for (uint32_t i = 0; i < u.count && i < 4; ++i)
+            DumpConstants(cl, param, static_cast<const buffer_range*>(u.descriptors)[i]);
 }
 
 void OnBindTables(command_list* cl, shader_stage stages, pipeline_layout, uint32_t first, uint32_t count,
