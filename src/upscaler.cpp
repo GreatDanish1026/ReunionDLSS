@@ -316,6 +316,84 @@ void OnDilateVelocity(command_list* cl, ListState& s) {
     if (g_depthByVelocity.size() > 64) g_depthByVelocity.clear();
 }
 
+// ---------------------------------------------------------------- motion vector sampling
+//
+// Diagnostics: about once a second, copies three 64-pixel strips of the motion vector copy
+// (screen center, left, top) to a CPU-readable buffer and logs their decoded values a few frames
+// later, to see what "no motion" looks like in TSR's dilated velocity.
+
+constexpr uint32_t kStrip = 64, kStripPitch = 512;  // D3D12 copy placement alignment
+struct Sample {
+    resource buffer = {0};
+    uint64_t frame = 0;
+    bool pending = false;
+    uint32_t width = 0, height = 0;
+};
+Sample g_samples[3];
+uint64_t g_presentFrame = 0, g_lastSampleFrame = 0;
+
+float Half(uint16_t h) {
+    const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+    float v;
+    if (exp == 0) v = std::ldexp(static_cast<float>(man), -24);
+    else if (exp == 31) v = man ? NAN : INFINITY;
+    else v = std::ldexp(static_cast<float>(man | 0x400), static_cast<int>(exp) - 25);
+    return sign ? -v : v;
+}
+
+void SampleMotion(command_list* cl, resource tex) {
+    if (g_presentFrame - g_lastSampleFrame < 60) return;
+    Sample* slot = nullptr;
+    for (Sample& sm : g_samples)
+        if (!sm.pending) slot = &sm;
+    if (!slot) return;
+    device* dev = cl->get_device();
+    if (!slot->buffer.handle &&
+        !dev->create_resource(resource_desc(3 * kStripPitch, memory_heap::readback, resource_usage::copy_dest), nullptr,
+                              resource_usage::copy_dest, &slot->buffer))
+        return;
+    const resource_desc d = dev->get_resource_desc(tex);
+    const uint32_t w = d.texture.width, h = d.texture.height;
+    const subresource_box boxes[3] = {
+        {w / 2 - kStrip / 2, h / 2, 0, w / 2 + kStrip / 2, h / 2 + 1, 1},
+        {w / 8, h / 2, 0, w / 8 + kStrip, h / 2 + 1, 1},
+        {w / 2 - kStrip / 2, h / 8, 0, w / 2 + kStrip / 2, h / 8 + 1, 1},
+    };
+    cl->barrier(tex, resource_usage::shader_resource_non_pixel, resource_usage::copy_source);
+    for (uint32_t i = 0; i < 3; ++i) cl->copy_texture_to_buffer(tex, 0, &boxes[i], slot->buffer, i * kStripPitch, kStrip, 1);
+    cl->barrier(tex, resource_usage::copy_source, resource_usage::shader_resource_non_pixel);
+    slot->pending = true;
+    slot->frame = g_presentFrame;
+    slot->width = w, slot->height = h;
+    g_lastSampleFrame = g_presentFrame;
+}
+
+void ReadSamples(device* dev) {
+    for (Sample& sm : g_samples) {
+        if (!sm.pending || g_presentFrame - sm.frame < 4) continue;
+        sm.pending = false;
+        void* data = nullptr;
+        if (!dev->map_buffer_region(sm.buffer, 0, 3 * kStripPitch, map_access::read_only, &data) || !data) continue;
+        const char* names[3] = {"center", "left", "top"};
+        char line[400];
+        int n = snprintf(line, sizeof(line), "motion sample (%ux%u, jitter %.3f %.3f, scale %.0f %.0f):", sm.width, sm.height,
+                         g_lastJitter[0], g_lastJitter[1], g_lastScale[0], g_lastScale[1]);
+        for (int i = 0; i < 3; ++i) {
+            const uint16_t* p = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(data) + i * kStripPitch);
+            float mn[2] = {1e30f, 1e30f}, mx[2] = {-1e30f, -1e30f}, sum[2] = {0, 0};
+            for (uint32_t k = 0; k < kStrip; ++k)
+                for (int c = 0; c < 2; ++c) {
+                    const float v = Half(p[k * 2 + c]);
+                    mn[c] = v < mn[c] ? v : mn[c], mx[c] = v > mx[c] ? v : mx[c], sum[c] += v;
+                }
+            n += snprintf(line + n, sizeof(line) - n, " %s x[%.5g..%.5g avg %.5g] y[%.5g..%.5g avg %.5g];", names[i], mn[0],
+                          mx[0], sum[0] / kStrip, mn[1], mx[1], sum[1] / kStrip);
+        }
+        dev->unmap_buffer_region(sm.buffer);
+        Log("%s", line);
+    }
+}
+
 void OnRejectShading(command_list* cl, ListState& s) {
     s.chain = Chain();
     const resource velocity = Bound(cl, s.compute, 0, 8);
@@ -323,6 +401,7 @@ void OnRejectShading(command_list* cl, ListState& s) {
     if (it == g_depthByVelocity.end()) return;
     s.chain.depth = it->second;
     s.chain.motion = CopyInput(cl, velocity, resource_usage::shader_resource_non_pixel, format::r16g16_float, "motion");
+    if (s.chain.motion.handle) SampleMotion(cl, s.chain.motion);
     if (g_set.colorSource == 1)
         s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
                                   format::r16g16b16a16_float, "scene color");
@@ -438,11 +517,18 @@ void OnDestroyDevice(device* dev) {
     std::lock_guard<std::mutex> lock(g_mutex);
     dlss::Shutdown();
     g_pool.Destroy(dev);
+    for (Sample& sm : g_samples)
+        if (sm.buffer.handle) dev->destroy_resource(sm.buffer), sm.buffer = {0};
 }
 
 bool g_keyWasDown = false;
 
-void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        ++g_presentFrame;
+        ReadSamples(sc->get_device());
+    }
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
