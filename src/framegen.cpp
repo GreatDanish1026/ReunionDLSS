@@ -110,6 +110,7 @@ Tagged g_inputs, g_hudless;  // depth + motion + constants; the picture before t
 uint32_t g_bbWidth = 0, g_bbHeight = 0;
 format g_bbFormat = format::unknown;
 resource g_hudlessTex = {0};
+resource g_uiReadback = {0};  // one row of the HUD layer, for its check
 device* g_hudlessDevice = nullptr;
 std::atomic<uint64_t> g_hudlessCount{0};
 bool g_fgOn = false;                  // what Streamline was last told
@@ -222,6 +223,8 @@ void SetFrameGeneration(bool on) {
     g_fgOn = mode != kOff;
 }
 
+void CheckUiRow();
+
 void BeforePresent() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_ready) return;
@@ -253,6 +256,7 @@ void BeforePresent() {
             g_state = st;
         }
     }
+    CheckUiRow();
     Marker(sl::PCLMarker::ePresentStart);
 }
 
@@ -578,6 +582,7 @@ void OnDestroyDevice(device* dev) {
     if (dev->get_api() != device_api::d3d12) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_hudlessTex.handle && g_hudlessDevice == dev) dev->destroy_resource(g_hudlessTex), g_hudlessTex = {0};
+    if (g_uiReadback.handle && g_hudlessDevice == dev) dev->destroy_resource(g_uiReadback), g_uiReadback = {0};
     if (!g_ready) return;
     g_ready = false;
     g_sl.shutdown();
@@ -597,6 +602,88 @@ sl::FrameToken* TokenFor(uint32_t frame) {
     if (frame == g_frame) return g_token;
     sl::FrameToken* t = nullptr;
     return g_sl.getNewFrameToken(t, &frame) == sl::Result::eOk ? t : nullptr;
+}
+
+// ---------------------------------------------------------------- the HUD layer
+//
+// The HUD is drawn into its own back-buffer-sized 8-bit layer, the last one bound before the
+// scene copy (below): its alpha says where the HUD is, which frame generation needs to keep the
+// HUD from warping. UE may store that alpha inverted, so a row of it is read back once (top
+// middle of the screen, normally free of HUD): alpha 0 there means it can be used as is.
+
+struct __declspec(uuid("9a4e0c2b-6d1f-4b83-a5e7-2c8f1b0d3e74")) FgList {
+    resource uiLayer = {0};  // last back-buffer-sized 8-bit render target bound on this list
+};
+
+enum class UiCheck { pending, reading, usable, unusable };
+UiCheck g_uiCheck = UiCheck::pending;
+uint64_t g_uiReadAt = 0;  // present count when the readback copy was recorded
+int g_uiTries = 0;
+std::atomic<uint64_t> g_uiCount{0};
+
+void OnInitList(command_list* cl) { cl->create_private_data<FgList>(); }
+void OnDestroyList(command_list* cl) { cl->destroy_private_data<FgList>(); }
+void OnResetList(command_list* cl) {
+    if (FgList* l = cl->get_private_data<FgList>()) l->uiLayer = {0};
+}
+
+bool IsUiFormat(format f) {
+    return f == format::b8g8r8a8_typeless || f == format::b8g8r8a8_unorm || f == format::r8g8b8a8_typeless ||
+           f == format::r8g8b8a8_unorm;
+}
+
+void OnBindRenderTargets(command_list* cl, uint32_t count, const resource_view* rtvs, resource_view) {
+    if (!g_ready || !g_set.enabled || !g_bbWidth || count == 0 || !rtvs[0].handle) return;
+    FgList* l = cl->get_private_data<FgList>();
+    if (!l) return;
+    device* dev = cl->get_device();
+    const resource r = dev->get_resource_from_view(rtvs[0]);
+    if (!r.handle) return;
+    const resource_desc d = dev->get_resource_desc(r);
+    if (d.type == resource_type::texture_2d && d.texture.width == g_bbWidth && d.texture.height == g_bbHeight &&
+        IsUiFormat(d.texture.format))
+        l->uiLayer = r;
+}
+
+// Records a copy of 64 pixels of the HUD layer's top-middle row (state render target).
+void ReadUiRow(command_list* cl, resource ui) {
+    device* dev = cl->get_device();
+    if (!g_uiReadback.handle &&
+        !dev->create_resource(resource_desc(256, memory_heap::readback, resource_usage::copy_dest), nullptr,
+                              resource_usage::copy_dest, &g_uiReadback)) {
+        g_uiCheck = UiCheck::unusable;
+        return;
+    }
+    const subresource_box box = {g_bbWidth / 2 - 32, g_bbHeight / 4, 0, g_bbWidth / 2 + 32, g_bbHeight / 4 + 1, 1};
+    cl->barrier(ui, resource_usage::render_target, resource_usage::copy_source);
+    cl->copy_texture_to_buffer(ui, 0, &box, g_uiReadback, 0, 64, 1);
+    cl->barrier(ui, resource_usage::copy_source, resource_usage::render_target);
+    g_uiCheck = UiCheck::reading;
+    g_uiReadAt = g_presents;
+}
+
+// A few frames later (the GPU is done): alpha 0 everywhere in the row means usable.
+void CheckUiRow() {
+    if (g_uiCheck != UiCheck::reading || g_presents < g_uiReadAt + 4 || !g_hudlessDevice) return;
+    void* data = nullptr;
+    if (!g_hudlessDevice->map_buffer_region(g_uiReadback, 0, 256, map_access::read_only, &data) || !data) {
+        g_uiCheck = UiCheck::unusable;
+        return;
+    }
+    const uint8_t* px = static_cast<const uint8_t*>(data);
+    int zero = 0, full = 0;
+    for (int i = 0; i < 64; ++i) zero += px[i * 4 + 3] == 0, full += px[i * 4 + 3] == 255;
+    g_hudlessDevice->unmap_buffer_region(g_uiReadback);
+    if (zero == 64) {
+        g_uiCheck = UiCheck::usable;
+        Log("frame generation: HUD layer alpha is 0 where there's no HUD: used as the UI buffer");
+    } else if (++g_uiTries < 5) {
+        g_uiCheck = UiCheck::pending;  // maybe HUD there right now: look again later
+        Log("frame generation: HUD layer check %d: %d of 64 pixels transparent, %d opaque", g_uiTries, zero, full);
+    } else {
+        g_uiCheck = UiCheck::unusable;
+        Log("frame generation: HUD layer alpha doesn't look like a UI mask (%d of 64 transparent): not used", zero);
+    }
 }
 
 // UE's HDR output draws the HUD into separate layers, copies the finished scene out of the back
@@ -647,6 +734,20 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
     }
     g_hudless.Set(frame);
     ++g_hudlessCount;
+    FgList* l = cl->get_private_data<FgList>();
+    const resource ui = l ? l->uiLayer : resource{0};
+    if (ui.handle) {
+        if (g_uiCheck == UiCheck::pending && g_presents > 120) ReadUiRow(cl, ui);  // past the first frames
+        if (g_uiCheck == UiCheck::usable) {
+            // Streamline copies it now (the game blends it into the back buffer right after).
+            sl::Resource uiRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(ui.handle), nullptr, nullptr,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const sl::ResourceTag uiTag(&uiRes, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eOnlyValidNow, &extent);
+            if (g_sl.setTagForFrame(*token, sl::ViewportHandle(0), &uiTag, 1,
+                                    reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native())) == sl::Result::eOk)
+                ++g_uiCount;
+        }
+    }
     return false;  // the game's copy goes ahead
 }
 
@@ -769,6 +870,10 @@ void RegisterFrameGen() {
     reshade::register_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
     reshade::register_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
     reshade::register_event<reshade::addon_event::copy_resource>(&OnCopyResource);
+    reshade::register_event<reshade::addon_event::init_command_list>(&OnInitList);
+    reshade::register_event<reshade::addon_event::destroy_command_list>(&OnDestroyList);
+    reshade::register_event<reshade::addon_event::reset_command_list>(&OnResetList);
+    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
 }
 
 void UnregisterFrameGen() {
@@ -777,6 +882,10 @@ void UnregisterFrameGen() {
     reshade::unregister_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
     reshade::unregister_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
     reshade::unregister_event<reshade::addon_event::copy_resource>(&OnCopyResource);
+    reshade::unregister_event<reshade::addon_event::init_command_list>(&OnInitList);
+    reshade::unregister_event<reshade::addon_event::destroy_command_list>(&OnDestroyList);
+    reshade::unregister_event<reshade::addon_event::reset_command_list>(&OnResetList);
+    reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
     Unpatch();  // this add-on's code is about to go away
 }
 
@@ -815,6 +924,11 @@ void DrawFrameGenOverlay() {
     ImGui::TextDisabled("Game frames %llu, with inputs %llu, with the picture before the HUD %llu",
                         static_cast<unsigned long long>(g_presents.load()), static_cast<unsigned long long>(g_tagged.load()),
                         static_cast<unsigned long long>(g_hudlessCount.load()));
+    ImGui::TextDisabled("HUD layer: %s (%llu frames)",
+                        g_uiCheck == UiCheck::usable     ? "used"
+                        : g_uiCheck == UiCheck::unusable ? "not usable"
+                                                         : "checking",
+                        static_cast<unsigned long long>(g_uiCount.load()));
 }
 
 }  // namespace rd
