@@ -48,37 +48,18 @@ namespace {
 constexpr int kToggleHotkey = VK_F9;
 
 struct Settings {
-    bool enabled = false;  // off at every start until switched on in the overlay (or F9)
+    bool enabled = false;  // remembered across launches
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
-    bool flipMotionX = false, flipMotionY = false;
-    bool flipJitterX = false, flipJitterY = false;
-    int motionSource = 0;  // 0 computed (camera + objects), 1 TSR's dilated texture (shimmers), 2 off (zero)
-    bool transposeMatrix = false;  // diagnostics: View.ClipToPrevClip read as columns
-    int colorSource = 0;  // diagnostics: 0 TSR's feed (UpdateHistory t0), 1 scene color (RejectShading t0)
 } g_set;
 
 void LoadSettings() {
-    // DLSS always starts off while it's in development (a GPU crash at start can't repeat):
-    // F9 or the overlay switches it on.
+    reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "FlipMotionX", g_set.flipMotionX);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "FlipMotionY", g_set.flipMotionY);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "MotionSource", g_set.motionSource);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "ColorSource", g_set.colorSource);
 }
 
 void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "FlipMotionX", g_set.flipMotionX);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "FlipMotionY", g_set.flipMotionY);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "MotionSource", g_set.motionSource);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "TransposeMatrix", g_set.transposeMatrix);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "ColorSource", g_set.colorSource);
 }
 
 // ---------------------------------------------------------------- per command list bindings
@@ -316,7 +297,7 @@ std::atomic<uint64_t> g_evaluated{0}, g_skipped{0};
 std::string g_error;
 std::map<uint64_t, bool> g_resetByOutput;  // per view
 bool g_resetAll = true;
-float g_lastJitter[2] = {0, 0}, g_lastScale[2] = {0, 0};
+float g_lastJitter[2] = {0, 0};
 
 constexpr uint32_t kViewScanFloats = 4096;  // the first 16 KB of the View uniform buffer
 
@@ -326,7 +307,6 @@ struct MotionState {
     bool failed = false;
     int offset = -1;  // byte offset of View.ClipToPrevClip, -1 until found
     int candidate = -1, hits = 0;
-    float matrix[16] = {};  // the last one used (log)
     std::map<std::pair<uint64_t, int>, resource_view> views;  // by resource and kind (0 SRV, 1 UAV)
     struct Texture {
         uint32_t width = 0, height = 0;
@@ -335,115 +315,9 @@ struct MotionState {
     std::vector<Texture> textures;  // rg16f, one per size, kept until shutdown
 } g_motion;
 
-void LogMatrix(const char* label, const float* m) {
-    Log("%s: [%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f]", label, m[0], m[1],
-        m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
-}
-
-// ---------------------------------------------------------------- texture sampling
-//
-// Diagnostics: about once a second, copies a 64-pixel strip at the screen center of a few TSR
-// textures (every array layer) to CPU-readable buffers and logs their decoded values a few
-// frames later, to find which one holds the motion vectors and how they're encoded.
-
-constexpr uint32_t kStrip = 64, kStripPitch = 1024;  // pitch: room for 16 bytes per pixel, 512-aligned
-constexpr uint32_t kMaxLayers = 4;
-
-enum class Decode { Half2, Uint, Unorm4 };
-
-struct Sample {
-    const char* label = "";
-    Decode decode = Decode::Half2;
-    resource buffer = {0};
-    uint64_t frame = 0, lastFrame = 0;
-    bool pending = false;
-    uint32_t width = 0, height = 0, layers = 1, bytes = 4;
-};
-Sample g_samples[1] = {{"computed motion (render pixels, previous minus current)", Decode::Half2}};
-uint64_t g_presentFrame = 0;
-
-float Half(uint16_t h) {
-    const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
-    float v;
-    if (exp == 0) v = std::ldexp(static_cast<float>(man), -24);
-    else if (exp == 31) v = man ? NAN : INFINITY;
-    else v = std::ldexp(static_cast<float>(man | 0x400), static_cast<int>(exp) - 25);
-    return sign ? -v : v;
-}
-
-void SampleTexture(command_list* cl, Sample& sm, resource tex, resource_usage state) {
-    if (!tex.handle || sm.pending || g_presentFrame - sm.lastFrame < 60) return;
-    device* dev = cl->get_device();
-    if (!sm.buffer.handle &&
-        !dev->create_resource(resource_desc(kMaxLayers * kStripPitch, memory_heap::readback, resource_usage::copy_dest),
-                              nullptr, resource_usage::copy_dest, &sm.buffer))
-        return;
-    const resource_desc d = dev->get_resource_desc(tex);
-    const uint32_t w = d.texture.width, h = d.texture.height;
-    const uint32_t layers = d.texture.depth_or_layers < kMaxLayers ? d.texture.depth_or_layers : kMaxLayers;
-    const uint32_t levels = d.texture.levels ? d.texture.levels : 1;
-    const subresource_box box = {w / 2 - kStrip / 2, h / 2, 0, w / 2 + kStrip / 2, h / 2 + 1, 1};
-    cl->barrier(tex, state, resource_usage::copy_source);
-    for (uint32_t l = 0; l < layers; ++l)
-        cl->copy_texture_to_buffer(tex, l * levels, &box, sm.buffer, l * kStripPitch, kStrip, 1);
-    cl->barrier(tex, resource_usage::copy_source, state);
-    sm.pending = true;
-    sm.frame = sm.lastFrame = g_presentFrame;
-    sm.width = w, sm.height = h, sm.layers = layers;
-}
-
-void ReadSamples(device* dev) {
-    for (Sample& sm : g_samples) {
-        if (!sm.pending || g_presentFrame - sm.frame < 4) continue;
-        sm.pending = false;
-        void* data = nullptr;
-        if (!dev->map_buffer_region(sm.buffer, 0, kMaxLayers * kStripPitch, map_access::read_only, &data) || !data) continue;
-        for (uint32_t l = 0; l < sm.layers; ++l) {
-            const uint8_t* row = static_cast<const uint8_t*>(data) + l * kStripPitch;
-            char line[700];
-            int n = snprintf(line, sizeof(line), "sample %s %ux%u layer %u (jitter %.3f %.3f): ", sm.label, sm.width,
-                             sm.height, l, g_lastJitter[0], g_lastJitter[1]);
-            for (uint32_t k = 0; k < kStrip; k += 8) {  // every 8th pixel
-                if (sm.decode == Decode::Half2) {
-                    const uint16_t* p = reinterpret_cast<const uint16_t*>(row) + k * 2;
-                    n += snprintf(line + n, sizeof(line) - n, "(%.4g %.4g) ", Half(p[0]), Half(p[1]));
-                } else if (sm.decode == Decode::Uint) {
-                    const uint32_t v = reinterpret_cast<const uint32_t*>(row)[k];
-                    n += snprintf(line + n, sizeof(line) - n, "%08x=(%.4g %.4g) ", v, Half(static_cast<uint16_t>(v & 0xffff)),
-                                  Half(static_cast<uint16_t>(v >> 16)));
-                } else {
-                    const uint16_t* p = reinterpret_cast<const uint16_t*>(row) + k * 4;
-                    n += snprintf(line + n, sizeof(line) - n, "(%.5f %.5f %.5f %.5f) ", p[0] / 65535.0, p[1] / 65535.0,
-                                  p[2] / 65535.0, p[3] / 65535.0);
-                }
-                if (n > 600) break;
-            }
-            Log("%s", line);
-        }
-        dev->unmap_buffer_region(sm.buffer);
-        LogMatrix("  ClipToPrevClip used", g_motion.matrix);
-    }
-}
-
 // ---------------------------------------------------------------- motion vectors
 
 bool Near(float a, float b) { return std::fabs(a - b) <= b * 2e-3f + 1e-9f; }
-
-// Writes the View uniform buffer's first floats to ReunionDLSS-view.txt (once), to check offline
-// which matrix is where.
-void DumpView(const float* v, const float jitter[2], const float size[2]) {
-    static bool done = false;
-    if (done) return;
-    done = true;
-    FILE* f = _wfopen((ExeDir() + L"ReunionDLSS-view.txt").c_str(), L"w");
-    if (!f) return;
-    fprintf(f, "View uniform buffer, %u floats. Jitter %.6f %.6f px, render size %.0f x %.0f\n", kViewScanFloats, jitter[0],
-            jitter[1], size[0], size[1]);
-    for (uint32_t i = 0; i < kViewScanFloats; i += 4)
-        fprintf(f, "%5u: %12.6g %12.6g %12.6g %12.6g\n", i * 4, v[i], v[i + 1], v[i + 2], v[i + 3]);
-    fclose(f);
-    Log("View uniform buffer written to ReunionDLSS-view.txt");
-}
 
 // UE's View uniform buffer has ClipToPrevClip, ClipToPrevClipWithAA, TemporalAAJitter in that
 // order. TemporalAAJitter is (this frame's jitter, last frame's) in clip units (2 / size, either
@@ -457,21 +331,17 @@ bool LooksLikeClipToPrevClip(const float* m) {
 }
 
 void FindClipToPrevClip(const float* v, const float jitter[2], const float size[2]) {
-    DumpView(v, jitter, size);
     const float jx = std::fabs(jitter[0] * 2 / size[0]), jy = std::fabs(jitter[1] * 2 / size[1]);
     if (jx < 1e-5f || jy < 1e-5f) return;  // too close to zero to tell apart
-    static int searches = 0;
-    const bool logMatches = searches++ < 3;  // the first few searches only
     int found = -1;
     for (uint32_t i = 32; i + 4 <= kViewScanFloats; i += 4) {
         if (!Near(std::fabs(v[i]), jx) || !Near(std::fabs(v[i + 1]), jy)) continue;
         const bool prevJitter = std::fabs(v[i + 2]) < 0.01f && std::fabs(v[i + 3]) < 0.01f &&
                                 (v[i + 2] != 0 || v[i + 3] != 0);
-        const bool ok = prevJitter && LooksLikeClipToPrevClip(v + i - 32);
-        if (logMatches)
-            Log("  jitter at byte %u: %.6f %.6f %.6f %.6f%s", i * 4, v[i], v[i + 1], v[i + 2], v[i + 3],
-                ok ? " (ClipToPrevClip before it)" : "");
-        if (ok && found < 0) found = static_cast<int>(i - 32) * 4;
+        if (prevJitter && LooksLikeClipToPrevClip(v + i - 32)) {
+            found = static_cast<int>(i - 32) * 4;
+            break;
+        }
     }
     if (found < 0) {
         g_motion.candidate = -1, g_motion.hits = 0;
@@ -481,10 +351,7 @@ void FindClipToPrevClip(const float* v, const float jitter[2], const float size[
     else g_motion.candidate = found, g_motion.hits = 1;
     if (g_motion.hits < 4) return;
     g_motion.offset = found;
-    Log("View.ClipToPrevClip at byte %d of the View uniform buffer; TemporalAAJitter %.6f %.6f %.6f %.6f", found,
-        v[found / 4 + 32], v[found / 4 + 33], v[found / 4 + 34], v[found / 4 + 35]);
-    LogMatrix("ClipToPrevClip", v + found / 4);
-    LogMatrix("ClipToPrevClipWithAA", v + found / 4 + 16);
+    Log("View.ClipToPrevClip at byte %d of the View uniform buffer", found);
 }
 
 bool CreateMotionPipeline(device* dev) {
@@ -587,9 +454,7 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
 
     float params[20];
     const float* m = view.data() + g_motion.offset / 4;
-    for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c) params[r * 4 + c] = g_set.transposeMatrix ? m[c * 4 + r] : m[r * 4 + c];
-    memcpy(g_motion.matrix, params, sizeof(g_motion.matrix));
+    memcpy(params, m, 16 * sizeof(float));
     params[16] = size[0], params[17] = size[1], params[18] = 1 / size[0], params[19] = 1 / size[1];
 
     cl->barrier(tex, resource_usage::shader_resource_non_pixel, resource_usage::unordered_access);
@@ -607,7 +472,6 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     cl->dispatch((static_cast<uint32_t>(size[0]) + 7) / 8, (static_cast<uint32_t>(size[1]) + 7) / 8, 1);
     cl->barrier(tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
     Restore(cl, s);
-    SampleTexture(cl, g_samples[0], tex, resource_usage::shader_resource_non_pixel);
     return tex;
 }
 
@@ -629,7 +493,7 @@ void OnDilateVelocity(command_list* cl, ListState& s) {
     if (g_links.size() > 64) g_links.clear();
     Link& link = g_links[out.handle];
     link.depth = depth;
-    link.motion = g_set.motionSource == 0 ? ComputeMotion(cl, s, depth, velocity) : resource{0};
+    link.motion = ComputeMotion(cl, s, depth, velocity);
 }
 
 void OnRejectShading(command_list* cl, ListState& s) {
@@ -638,15 +502,11 @@ void OnRejectShading(command_list* cl, ListState& s) {
     auto it = g_links.find(dilated.handle);
     if (it == g_links.end()) return;
     s.chain.depth = it->second.depth;
-    if (g_set.motionSource == 0) s.chain.motion = it->second.motion;  // none: TSR kept for this view
-    else s.chain.motion = CopyInput(cl, dilated, resource_usage::shader_resource_non_pixel, format::r16g16_float, "motion");
-    if (g_set.colorSource == 1)
-        s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
-                                  format::r16g16b16a16_float, "scene color");
+    s.chain.motion = it->second.motion;  // none: TSR kept for this view
 }
 
 void OnUpdateHistory(command_list* cl, ListState& s) {
-    if (g_set.colorSource == 0 && s.chain.motion.handle)
+    if (s.chain.motion.handle)
         s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
                                   format::r16g16b16a16_float, "color");
 }
@@ -667,9 +527,8 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
         ++g_skipped;
         return false;
     }
-    float common[2] = {0, 0}, jitter[2] = {0, 0}, scale[2] = {0, 0};
-    if (!ReadConstants(cl, s.compute, 2, 0, common, 2) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2) ||
-        !ReadConstants(cl, s.compute, 2, 272, scale, 2)) {
+    float common[2] = {0, 0}, jitter[2] = {0, 0};
+    if (!ReadConstants(cl, s.compute, 2, 0, common, 2) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2)) {
         g_error = "TSR parameters not readable";
         ++g_skipped;
         return false;
@@ -688,7 +547,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
         ++g_skipped;
         return false;
     }
-    g_lastJitter[0] = jitter[0], g_lastJitter[1] = jitter[1], g_lastScale[0] = scale[0], g_lastScale[1] = scale[1];
+    g_lastJitter[0] = jitter[0], g_lastJitter[1] = jitter[1];
     if (g_resetAll) g_resetByOutput.clear(), g_resetAll = false;
     auto rs = g_resetByOutput.find(output.handle);
     const bool reset = rs == g_resetByOutput.end() || rs->second;
@@ -703,14 +562,8 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
     in.renderWidth = rw, in.renderHeight = rh;
     in.outputWidth = out.texture.width, in.outputHeight = out.texture.height;
-    in.jitterX = jitter[0] * (g_set.flipJitterX ? -1.0f : 1.0f);
-    in.jitterY = jitter[1] * (g_set.flipJitterY ? -1.0f : 1.0f);
-    // Ours are already previous minus current in pixels (what DLSS wants). TSR's texture would be
-    // current minus previous in screen units.
-    const float base[2] = {g_set.motionSource == 0 ? 1.0f : -scale[0], g_set.motionSource == 0 ? 1.0f : -scale[1]};
-    const float on = g_set.motionSource == 2 ? 0.0f : 1.0f;
-    in.motionScaleX = base[0] * on * (g_set.flipMotionX ? -1.0f : 1.0f);
-    in.motionScaleY = base[1] * on * (g_set.flipMotionY ? -1.0f : 1.0f);
+    in.jitterX = jitter[0], in.jitterY = jitter[1];
+    in.motionScaleX = 1, in.motionScaleY = 1;  // motion.hlsl writes previous minus current in pixels
     in.reset = reset;
     in.preset = g_set.preset;
     const bool ok = dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err);
@@ -756,8 +609,6 @@ void OnDestroyDevice(device* dev) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     dlss::Shutdown();
     g_pool.Destroy(dev);
-    for (Sample& sm : g_samples)
-        if (sm.buffer.handle) dev->destroy_resource(sm.buffer), sm.buffer = {0};
     for (auto& [key, v] : g_motion.views) dev->destroy_resource_view(v);
     g_motion.views.clear();
     for (MotionState::Texture& t : g_motion.textures) dev->destroy_resource(t.tex);
@@ -769,12 +620,7 @@ void OnDestroyDevice(device* dev) {
 
 bool g_keyWasDown = false;
 
-void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        ++g_presentFrame;
-        ReadSamples(sc->get_device());
-    }
+void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
@@ -829,10 +675,9 @@ void DrawUpscalerOverlay() {
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (g_set.enabled && !g_error.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_error.c_str());
-        ImGui::TextDisabled("Views upscaled: %llu, left to TSR: %llu. Jitter %.3f, %.3f px; velocity scale %.0f, %.0f",
+        ImGui::TextDisabled("Views upscaled: %llu, left to TSR: %llu",
                             static_cast<unsigned long long>(g_evaluated.load()),
-                            static_cast<unsigned long long>(g_skipped.load()), g_lastJitter[0], g_lastJitter[1],
-                            g_lastScale[0], g_lastScale[1]);
+                            static_cast<unsigned long long>(g_skipped.load()));
     }
     const char* presets[] = {"Default", "J", "K (transformer, recommended)", "L", "M"};
     const int ids[] = {0, 10, 11, 12, 13};
@@ -841,36 +686,12 @@ void DrawUpscalerOverlay() {
         if (ids[i] == g_set.preset) cur = i;
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
     if (ImGui::Combo("Preset", &cur, presets, 5)) g_set.preset = ids[cur], changed = true;
-    ImGui::SeparatorText("Calibration");
-    ImGui::TextDisabled("If the picture smears or shimmers when the camera moves, try these.");
-    changed |= ImGui::Checkbox("Flip motion X", &g_set.flipMotionX);
     ImGui::SameLine();
-    changed |= ImGui::Checkbox("Flip motion Y", &g_set.flipMotionY);
-    changed |= ImGui::Checkbox("Flip jitter X", &g_set.flipJitterX);
-    ImGui::SameLine();
-    changed |= ImGui::Checkbox("Flip jitter Y", &g_set.flipJitterY);
-    if (ImGui::Button("Reset DLSS history")) g_resetAll = true;
-    ImGui::SeparatorText("Diagnostics");
-    ImGui::TextDisabled("To find the cause of shimmering. Keep the camera still when comparing.");
-    const char* motionSources[] = {"Computed (default)", "TSR's texture (shimmers)", "Off (zero)"};
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
-    changed |= ImGui::Combo("Motion vectors", &g_set.motionSource, motionSources, 3);
-    ImGui::SameLine();
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        if (g_motion.offset >= 0) ImGui::TextDisabled("camera matrix at View +%d", g_motion.offset);
-        else ImGui::TextDisabled("looking for the camera matrix");
-    }
-    changed |= ImGui::Checkbox("Transpose camera matrix", &g_set.transposeMatrix);
-    const char* colorSources[] = {"TSR feed (default)", "Scene color"};
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
-    changed |= ImGui::Combo("Color input", &g_set.colorSource, colorSources, 2);
+    if (ImGui::Button("Reset history")) g_resetAll = true;
     if (changed) {
         g_resetAll = true;
         SaveSettings();
-        Log("settings: DLSS %s, preset %d, flip motion %d%d, flip jitter %d%d, motion source %d, transpose %d, color source %d",
-            g_set.enabled ? "on" : "off", g_set.preset, g_set.flipMotionX, g_set.flipMotionY, g_set.flipJitterX,
-            g_set.flipJitterY, g_set.motionSource, g_set.transposeMatrix, g_set.colorSource);
+        Log("settings: DLSS %s, preset %d", g_set.enabled ? "on" : "off", g_set.preset);
     }
 }
 
