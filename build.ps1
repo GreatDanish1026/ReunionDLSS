@@ -23,8 +23,8 @@ $addon = "$root\bin\ReunionDLSS.addon64"
 $cmd = @(
     "call `"$vcvars`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
-     "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" " +
-     "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" user32.lib " +
+     "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" " +
+     "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" `"$root\src\upscaler.cpp`" `"$root\src\dlss.cpp`" user32.lib advapi32.lib ole32.lib d3d12.lib dxgi.lib `"$root\third_party\dlss\lib\nvsdk_ngx_s.lib`" " +
      "/link /DLL /OUT:`"$addon`" /PDB:`"$obj\ReunionDLSS.pdb`" /DEBUG")
 ) -join " && "
 cmd /c $cmd

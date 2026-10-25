@@ -41,3 +41,42 @@ dilated velocity candidates).
 Resources are bound through descriptor tables (GPU handles; not resolved yet) plus root
 constant buffers: param 2 = the pass's own parameters, param 3 = a region every TSR pass and many
 others share (`+1540352` in a 4 MB buffer): the View uniform buffer.
+
+## TSR inputs and outputs (capture A, 2026-10-25, 0.0.3 table resolution)
+
+| pass | reads | writes |
+|---|---|---|
+| DilateVelocity `ed32101f` | t0 scene depth 2496x1404 `r32g8x24_typeless` (D32S8), t1 velocity rgba16unorm | u0 dilated velocity rg16f, u1-u3 closest depth / reprojection data |
+| RejectShading `abcfcc34` | t0/t2 scene color and separate translucency (rgba16f), t8 dilated velocity | u4 rgba16f: scene color with translucency (TSR's feed) |
+| UpdateHistory `d235f807` | t0 that feed | u0 history 7680x4320 rgba16f |
+| ResolveHistory `60acc0c7` | t0 history | u0 output 3840x2160 r11g11b10f, u1 1920x1080 half-res copy |
+
+Tables are padded: entries past the pass's real bindings are stale descriptors.
+
+The intermediates are transient: the dilated velocity's memory is reused right after
+SpatialAntiAliasing and the feed's right after UpdateHistory (barriers to `uav` on other
+resources at the same addresses). So DLSS copies them while they exist (RejectShading,
+UpdateHistory). The depth and the output stay valid at ResolveHistory (depth in state 0xe0,
+output in `uav`).
+
+TSR's common parameters (each pass's root CBV param 2, the same first ~300 bytes):
+offset 0 render size (2496, 1404), 112 history size (7680, 4320), 128 output (3840, -2160 ...),
+**256 jitter in render pixels** (Halton(2,3) - 0.5: frame N `-0.4375, 0.388889`, N+1 `0.0625,
+-0.462963`), **272 ScreenVelocityToInputPixelVelocity (1248, -702)**, then its inverse.
+
+DilateVelocity and DecimateHistory are recorded in a different command list from the other four
+passes (UE records lists in parallel), so per-frame values are read at ResolveHistory.
+
+## DLSS integration (0.1.0)
+
+ReShade 6.8's D3D12 layer: pipeline = `ID3D12PipelineState*`, layout = `ID3D12RootSignature*`,
+resource = `ID3D12Resource*`, descriptor tables are encoded (only ReShade converts them).
+`command_list::get_native()` is the unwrapped list, so NGX's own binds bypass ReShade, and
+ReShade keeps the game's heaps and root signatures cached; `bind_descriptor_tables` with no
+tables makes it set both again. The add-on tracks each list's compute and graphics bindings
+(tables, root descriptors, root constants, pipeline) and replays them after DLSS.
+
+DLSS DLL: signed `nvngx_dlss.dll` 310.9.16, copied from Jedi Survivor's DLSS plugin folder
+(updated there 2026-10-25) next to the game exe. Feature flags: HDR, low-res MVs, inverted
+depth, auto exposure; preset K by default; MV scale = -(TSR's 1248, -702), with flip switches
+in the overlay for calibration. Not tested in game yet.

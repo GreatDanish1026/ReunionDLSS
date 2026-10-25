@@ -26,11 +26,12 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common.hpp"
 #include "version.h"
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
 
 extern "C" __declspec(dllexport) const char* NAME = RD_PRODUCT;
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS for " RD_GAME " (in development: frame capture only).";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS for " RD_GAME " in place of TSR (in development).";
 
 namespace {
 
@@ -551,7 +552,9 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
 // ---------------------------------------------------------------- overlay
 
 void DrawOverlay(effect_runtime*) {
-    ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION " (frame capture only; changes nothing in the game)");
+    ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION " (in development)");
+    rd::DrawUpscalerOverlay();
+    ImGui::SeparatorText("Frame capture (for development)");
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
     if (ImGui::Button("Capture frame (F10)")) StartCapture();
     ImGui::EndDisabled();
@@ -565,6 +568,23 @@ void DrawOverlay(effect_runtime*) {
 
 }  // namespace
 
+namespace rd {
+
+void Log(const char* fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ::Log("%s", buf);
+}
+
+const std::wstring& ExeDir() { return g_exeDir; }
+
+uint32_t PipeId(pipeline pipe) { return ::PipeId(pipe); }
+
+}  // namespace rd
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
@@ -572,6 +592,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             g_loadTick = GetTickCount64();
             OpenLog();
             descriptor_tracking::register_events();
+            rd::RegisterUpscaler();
             reshade::register_event<reshade::addon_event::init_pipeline>(&OnInitPipeline);
             reshade::register_event<reshade::addon_event::destroy_pipeline>(&OnDestroyPipeline);
             reshade::register_event<reshade::addon_event::reset_command_list>(&OnReset);
@@ -592,6 +613,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_overlay(RD_PRODUCT, &DrawOverlay);
             break;
         case DLL_PROCESS_DETACH:
+            rd::UnregisterUpscaler();
             descriptor_tracking::unregister_events();
             reshade::unregister_addon(module);
             if (g_log) fclose(g_log);
