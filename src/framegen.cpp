@@ -11,7 +11,8 @@
 // latency markers, the frame token, frame generation on or off).
 //
 // Per frame, at the point DLSS upscales (upscaler.cpp), the depth, our motion vectors and the
-// camera constants (from the View uniform buffer) are handed to Streamline. Frames without them
+// camera constants (from the View uniform buffer) are handed to Streamline, and in HDR the
+// picture before the HUD (see OnCopyResource). Frames without them
 // (menus, loading, DLSS off) are presented without generated frames.
 //
 // Loading Streamline only happens if frame generation was on at launch: switching it on later
@@ -95,7 +96,22 @@ std::string g_status = "off";
 // Frames: the token of the frame being recorded; it advances after each game present.
 sl::FrameToken* g_token = nullptr;
 uint32_t g_frame = 0;
-uint32_t g_taggedFrame = UINT32_MAX;  // last frame that got depth, motion and constants
+// Inputs can arrive for the next frame while this one is still presenting (UE records frame N+1's
+// passes in parallel with frame N's Present): a frame that already has its inputs passes them on
+// to the next frame index. The last two frames given each kind of input are remembered.
+struct Tagged {
+    uint32_t last = UINT32_MAX, previous = UINT32_MAX;
+    bool Has(uint32_t frame) const { return last == frame || previous == frame; }
+    void Set(uint32_t frame) { previous = last, last = frame; }
+};
+Tagged g_inputs, g_hudless;  // depth + motion + constants; the picture before the HUD
+
+// Back buffer size and format (ReShade's swapchain), and our copy of the picture before the HUD.
+uint32_t g_bbWidth = 0, g_bbHeight = 0;
+format g_bbFormat = format::unknown;
+resource g_hudlessTex = {0};
+device* g_hudlessDevice = nullptr;
+std::atomic<uint64_t> g_hudlessCount{0};
 bool g_fgOn = false;                  // what Streamline was last told
 std::atomic<uint64_t> g_presents{0}, g_tagged{0};
 uint32_t g_untagged = 0;  // game frames in a row without inputs
@@ -213,7 +229,7 @@ void BeforePresent() {
     Marker(sl::PCLMarker::eRenderSubmitEnd);
     // A frame now and then misses its inputs (another view, a hitch): frame generation only
     // pauses after several in a row (menus, loading, DLSS off), since each switch can stutter.
-    g_untagged = g_taggedFrame == g_frame ? 0 : g_untagged + 1;
+    g_untagged = g_inputs.Has(g_frame) ? 0 : g_untagged + 1;
     SetFrameGeneration(g_set.enabled && g_tagged > 0 && g_untagged < 8);
     // The overlay's status, read here: Streamline wants it read on the presenting thread.
     if (g_sl.dlssgGetState && g_presents % 30 == 0) {
@@ -561,11 +577,94 @@ void OnInitDevice(device* dev) {
 void OnDestroyDevice(device* dev) {
     if (dev->get_api() != device_api::d3d12) return;
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_hudlessTex.handle && g_hudlessDevice == dev) dev->destroy_resource(g_hudlessTex), g_hudlessTex = {0};
     if (!g_ready) return;
     g_ready = false;
     g_sl.shutdown();
     g_status = "shut down";
     Log("frame generation: Streamline shut down");
+}
+
+// The frame index inputs are meant for: this frame, or the next one if this one has them already.
+// UINT32_MAX if both have them.
+uint32_t TargetFrame(const Tagged& t) {
+    if (!t.Has(g_frame)) return g_frame;
+    if (!t.Has(g_frame + 1)) return g_frame + 1;
+    return UINT32_MAX;
+}
+
+sl::FrameToken* TokenFor(uint32_t frame) {
+    if (frame == g_frame) return g_token;
+    sl::FrameToken* t = nullptr;
+    return g_sl.getNewFrameToken(t, &frame) == sl::Result::eOk ? t : nullptr;
+}
+
+// UE's HDR output draws the HUD into separate layers, copies the finished scene out of the back
+// buffer and then blends the HUD over that copy. The copy's source is the picture before the
+// HUD: it's copied into our own texture and handed to frame generation, so the HUD isn't warped
+// with the scene. (Without that copy, as in SDR, frame generation runs without it.)
+bool OnCopyResource(command_list* cl, resource src, resource dst) {
+    if (!g_ready || !g_set.enabled || !g_bbWidth) return false;
+    device* dev = cl->get_device();
+    const resource_desc sd = dev->get_resource_desc(src);
+    if (sd.type != resource_type::texture_2d || sd.texture.width != g_bbWidth || sd.texture.height != g_bbHeight ||
+        sd.texture.format != g_bbFormat)
+        return false;
+    const resource_desc dd = dev->get_resource_desc(dst);
+    if (dd.texture.width != g_bbWidth || dd.texture.height != g_bbHeight || dd.texture.format != g_bbFormat) return false;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_token) return false;
+    const uint32_t frame = TargetFrame(g_hudless);
+    if (frame == UINT32_MAX) return false;
+    if (!g_hudlessTex.handle) {
+        const resource_desc d(g_bbWidth, g_bbHeight, 1, 1, g_bbFormat, 1, memory_heap::default_,
+                              resource_usage::shader_resource | resource_usage::copy_dest);
+        if (!dev->create_resource(d, nullptr, resource_usage::shader_resource, &g_hudlessTex)) {
+            Log("frame generation: couldn't create the %ux%u pre-HUD texture", g_bbWidth, g_bbHeight);
+            g_bbWidth = 0;  // don't try again
+            return false;
+        }
+        g_hudlessDevice = dev;
+        Log("frame generation: pre-HUD picture found (%ux%u, format %u)", g_bbWidth, g_bbHeight,
+            static_cast<uint32_t>(g_bbFormat));
+    }
+    sl::FrameToken* token = TokenFor(frame);
+    if (!token) return false;
+    // The game has the back buffer in the copy-source state for its own copy, recorded after ours.
+    cl->barrier(g_hudlessTex, resource_usage::shader_resource, resource_usage::copy_dest);
+    cl->copy_resource(src, g_hudlessTex);
+    cl->barrier(g_hudlessTex, resource_usage::copy_dest, resource_usage::shader_resource);
+    sl::Resource res(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_hudlessTex.handle), nullptr, nullptr,
+                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::Extent extent{0, 0, g_bbWidth, g_bbHeight};
+    const sl::ResourceTag tag(&res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent);
+    const sl::Result r = g_sl.setTagForFrame(*token, sl::ViewportHandle(0), &tag, 1,
+                                             reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()));
+    if (r != sl::Result::eOk) {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: tagging the pre-HUD picture failed: %d", static_cast<int>(r));
+        return false;
+    }
+    g_hudless.Set(frame);
+    ++g_hudlessCount;
+    return false;  // the game's copy goes ahead
+}
+
+void OnInitSwapchain(swapchain* sc, bool) {
+    const resource bb = sc->get_back_buffer(0);
+    if (!bb.handle) return;
+    const resource_desc d = sc->get_device()->get_resource_desc(bb);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_hudlessTex.handle && (d.texture.width != g_bbWidth || d.texture.height != g_bbHeight || d.texture.format != g_bbFormat)) {
+        g_hudlessDevice->destroy_resource(g_hudlessTex);  // resize: the game waits for the GPU first
+        g_hudlessTex = {0};
+    }
+    g_bbWidth = d.texture.width, g_bbHeight = d.texture.height, g_bbFormat = d.texture.format;
+}
+
+void OnDestroySwapchain(swapchain*, bool) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_bbWidth = 0;  // no pre-HUD copies until the swapchain is back
 }
 
 }  // namespace
@@ -586,7 +685,11 @@ void FrameGenSetCamera(const float* view, int clipToPrevClipOffset) {
 void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned rw,
                  unsigned rh, float jitterX, float jitterY, bool reset) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_ready || !g_set.enabled || !g_token || !g_camera.valid || g_taggedFrame == g_frame) return;
+    if (!g_ready || !g_set.enabled || !g_token || !g_camera.valid) return;
+    const uint32_t frame = TargetFrame(g_inputs);
+    if (frame == UINT32_MAX) return;  // another view this frame
+    sl::FrameToken* token = TokenFor(frame);
+    if (!token) return;
     const Camera& cam = g_camera;
     sl::Constants c{};
     float inv[16], prevToCur[16], m[16];
@@ -625,7 +728,7 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
     c.orthographicProjection = sl::Boolean::eFalse;
     c.motionVectorsDilated = sl::Boolean::eFalse;
     c.motionVectorsJittered = sl::Boolean::eFalse;
-    sl::Result r = g_sl.setConstants(c, *g_token, sl::ViewportHandle(0));
+    sl::Result r = g_sl.setConstants(c, *token, sl::ViewportHandle(0));
     if (r != sl::Result::eOk) {
         static int logged = 0;
         if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
@@ -638,15 +741,18 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     sl::Resource motionRes(sl::ResourceType::eTex2d, motion, nullptr, nullptr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     const sl::Extent extent{0, 0, rw, rh};
-    const sl::ResourceTag tags[2] = {sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent),
-                                     sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent)};
-    r = g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, 2, list);
+    // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
+    const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
+    const sl::ResourceTag tags[3] = {sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent),
+                                     sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+                                     sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
+    r = g_sl.setTagForFrame(*token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, list);
     if (r != sl::Result::eOk) {
         static int logged = 0;
         if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
         return;
     }
-    g_taggedFrame = g_frame;
+    g_inputs.Set(frame);
     if (++g_tagged == 1) Log("frame generation: first frame tagged (%ux%u)", rw, rh);
 }
 
@@ -660,11 +766,17 @@ void RegisterFrameGen() {
     g_set.enabled = g_set.mode != kOff;
     reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
+    reshade::register_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
+    reshade::register_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
+    reshade::register_event<reshade::addon_event::copy_resource>(&OnCopyResource);
 }
 
 void UnregisterFrameGen() {
     reshade::unregister_event<reshade::addon_event::init_device>(&OnInitDevice);
     reshade::unregister_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
+    reshade::unregister_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
+    reshade::unregister_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
+    reshade::unregister_event<reshade::addon_event::copy_resource>(&OnCopyResource);
     Unpatch();  // this add-on's code is about to go away
 }
 
@@ -700,8 +812,9 @@ void DrawFrameGenOverlay() {
     ImGui::TextDisabled("%s", g_fgOn ? "generating frames" : g_set.enabled ? "waiting for DLSS (F9)" : "off");
     ImGui::TextDisabled("Frames presented per rendered frame: %u, status 0x%x", g_state.numFramesActuallyPresented,
                         static_cast<unsigned>(g_state.status));
-    ImGui::TextDisabled("Game frames %llu, with inputs %llu", static_cast<unsigned long long>(g_presents.load()),
-                        static_cast<unsigned long long>(g_tagged.load()));
+    ImGui::TextDisabled("Game frames %llu, with inputs %llu, with the picture before the HUD %llu",
+                        static_cast<unsigned long long>(g_presents.load()), static_cast<unsigned long long>(g_tagged.load()),
+                        static_cast<unsigned long long>(g_hudlessCount.load()));
 }
 
 }  // namespace rd
