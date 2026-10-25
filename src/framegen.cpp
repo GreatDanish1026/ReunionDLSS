@@ -1002,55 +1002,71 @@ void UnregisterFrameGen() {
     Unpatch();  // this add-on's code is about to go away
 }
 
-void DrawFrameGenOverlay() {
-    ImGui::SeparatorText("Frame generation (DLSS-G)");
+void DrawFrameGenSettings() {
+    ImGui::SeparatorText("Frame generation");
     int mode = g_set.mode;
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10);
+    ImGui::SetNextItemWidth(ControlWidth());
     if (ImGui::Combo("Frame generation", &mode, kModeNames, kModeCount)) {
         g_set.mode = mode;
         g_set.enabled = mode != kOff;
         reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", mode);
         Log("settings: frame generation %s", kModeNames[mode]);
     }
+    Help("NVIDIA DLSS Frame Generation: 2x, 3x and 4x add 1, 2 or 3 generated frames per rendered frame. Dynamic "
+         "picks the multiplier to reach the display's refresh rate.\n\nNeeds DLSS on. Switching from Off takes "
+         "a game restart; the multipliers switch right away.");
+
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
-        ImGui::TextDisabled("%s isn't supported here, so %s.", kModeNames[g_set.mode], kModeNames[EffectiveMode(g_set.mode)]);
-    if (g_set.enabled && !g_ready) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_initTried || g_factoryHooked ? g_status.c_str()
-                                                                                         : "restart the game to load it");
-        return;
-    }
-    if (!g_ready) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("off");
-        return;
-    }
     ImGui::SameLine();
-    if (!g_upgraded) {
-        ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "the game's swapchain wasn't handed to Streamline (see the log)");
-        return;
+    if (!g_set.enabled) {
+        ImGui::TextDisabled(g_ready ? "off" : "");
+    } else if (!g_ready) {
+        ImGui::TextColored(kWarn, "%s", g_initTried || g_factoryHooked ? g_status.c_str() : "restart the game to start it");
+    } else if (!g_upgraded) {
+        ImGui::TextColored(kWarn, "not running: the game's swapchain wasn't handed over (see the log)");
+    } else if (!g_fgOn) {
+        ImGui::TextDisabled("waiting for DLSS (F9)");
+    } else {
+        ImGui::TextDisabled("%u frames per rendered frame", g_state.numFramesActuallyPresented);
     }
-    ImGui::TextDisabled("%s", g_fgOn ? "generating frames" : g_set.enabled ? "waiting for DLSS (F9)" : "off");
-    ImGui::TextDisabled("Frames presented per rendered frame: %u, status 0x%x", g_state.numFramesActuallyPresented,
-                        static_cast<unsigned>(g_state.status));
-    ImGui::TextDisabled("Game frames %llu, with inputs %llu, with the picture before the HUD %llu",
-                        static_cast<unsigned long long>(g_presents.load()), static_cast<unsigned long long>(g_tagged.load()),
-                        static_cast<unsigned long long>(g_hudlessCount.load()));
-    ImGui::TextDisabled("HUD mask: %s (%llu frames)",
-                        g_uiCheck == UiCheck::usable     ? "used"
-                        : g_uiCheck == UiCheck::inverted ? "used (alpha flipped)"
-                        : g_uiCheck == UiCheck::unusable ? "not usable"
-                                                         : "checking",
-                        static_cast<unsigned long long>(g_uiCount.load()));
+    if (g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
+        ImGui::TextColored(kWarn, "%s isn't supported here, so %s.", kModeNames[g_set.mode],
+                           kModeNames[EffectiveMode(g_set.mode)]);
+
     float sep = g_set.separation;
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
+    ImGui::SetNextItemWidth(ControlWidth());
     if (ImGui::SliderFloat("Object separation", &sep, 1, 40, "%.0f")) g_set.separation = sep;
     if (ImGui::IsItemDeactivatedAfterEdit()) {
         reshade::set_config_value(nullptr, RD_PRODUCT, "ObjectSeparation", g_set.separation);
         Log("settings: object separation %.0f", g_set.separation);
     }
-    ImGui::TextDisabled("How far apart in depth things must be to move separately: 40 = 4 m (NVIDIA's default), 10 = 1 m.");
+    Help("How far apart in depth two things must be for frame generation to move them separately. 40 (NVIDIA's "
+         "default) is about 4 m in this game, 10 about 1 m. Lower it if people moving in front of walls ghost.");
+}
+
+void DrawFrameGenStatus() {
+    ImGui::SeparatorText("Frame generation");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_ready) {
+        ImGui::TextDisabled("Streamline: %s", g_status.c_str());
+        return;
+    }
+    const unsigned st = static_cast<unsigned>(g_state.status);
+    ImGui::TextDisabled("Streamline 2.14: %s; up to %u generated frames, Dynamic %s", g_fgOn ? kModeNames[g_appliedMode] : "paused",
+                        g_maxFrames, g_dynamicSupported ? "supported" : "not supported");
+    if (st)
+        ImGui::TextColored(kWarn, "DLSS-G status 0x%x%s%s%s%s%s", st, (st & 1) ? " resolution too low" : "",
+                           (st & 2) ? " Reflex not detected" : "", (st & 4) ? " HDR format not supported" : "",
+                           (st & 8) ? " constants invalid" : "", (st & 16) ? " back buffer index not queried" : "");
+    ImGui::TextDisabled("Game frames %llu: with depth and motion %llu, with the picture before the HUD %llu",
+                        static_cast<unsigned long long>(g_presents.load()), static_cast<unsigned long long>(g_tagged.load()),
+                        static_cast<unsigned long long>(g_hudlessCount.load()));
+    ImGui::TextDisabled("HUD mask: %s (%llu frames)",
+                        g_uiCheck == UiCheck::usable     ? "used"
+                        : g_uiCheck == UiCheck::inverted ? "used (the game's alpha, flipped)"
+                        : g_uiCheck == UiCheck::unusable ? "not usable"
+                                                         : "checking",
+                        static_cast<unsigned long long>(g_uiCount.load()));
 }
 
 }  // namespace rd

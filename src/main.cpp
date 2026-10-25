@@ -557,24 +557,44 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
 // ---------------------------------------------------------------- overlay
 
 void DrawOverlay(effect_runtime*) {
-    ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION " (in development)");
-    rd::DrawUpscalerOverlay();
-    rd::DrawFrameGenOverlay();
-    ImGui::SeparatorText("Frame capture (for development)");
-    ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
-    if (ImGui::Button("Capture frame (F10)")) StartCapture();
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
-    {
-        std::lock_guard<std::mutex> lock(g_pipeMutex);
-        ImGui::TextDisabled("%zu compute pipelines known", g_pipeHash.size());
+    ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION);
+    if (!ImGui::BeginTabBar("tabs")) return;
+    if (ImGui::BeginTabItem("Settings")) {
+        rd::DrawUpscalerSettings();
+        rd::DrawFrameGenSettings();
+        ImGui::EndTabItem();
     }
+    if (ImGui::BeginTabItem("Status")) {
+        rd::DrawUpscalerStatus();
+        rd::DrawFrameGenStatus();
+        ImGui::SeparatorText("Frame capture");
+        ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
+        if (ImGui::Button("Capture frame (F10)")) StartCapture();
+        ImGui::EndDisabled();
+        rd::Help("Writes every command of one frame to ReunionDLSS-frame-N.txt next to the game's exe, for "
+                 "finding passes when the game updates.");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
+        ImGui::SeparatorText("Logs");
+        ImGui::TextDisabled("ReunionDLSS.log and streamline\\sl.log next to the game's exe");
+        ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
 }
 
 }  // namespace
 
 namespace rd {
+
+const ImVec4 kWarn(1.0f, 0.7f, 0.3f, 1.0f);
+
+float ControlWidth() { return ImGui::GetFontSize() * 14.0f; }
+
+void Help(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
 
 void Log(const char* fmt, ...) {
     char buf[1024];

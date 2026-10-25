@@ -36,7 +36,14 @@ constexpr uint32_t kTsrResolveHistory = 0x60acc0c7;
 // upscaler.cpp
 void RegisterUpscaler();
 void UnregisterUpscaler();
-void DrawUpscalerOverlay();
+// Overlay: the Settings tab and the Status tab.
+void DrawUpscalerSettings();
+void DrawUpscalerStatus();
+
+// Overlay helpers (main.cpp), in ReunionTweaks' style.
+float ControlWidth();
+void Help(const char* text);  // a "(?)" after the last item, with <text> as its tooltip
+extern const ImVec4 kWarn;
 // Puts the game's pipeline, root signatures, descriptor heaps and bindings back on <cl> after
 // the add-on recorded work of its own on it.
 void RestoreListState(reshade::api::command_list* cl);
@@ -44,7 +51,8 @@ void RestoreListState(reshade::api::command_list* cl);
 // framegen.cpp: DLSS Frame Generation through Streamline.
 void RegisterFrameGen();
 void UnregisterFrameGen();
-void DrawFrameGenOverlay();
+void DrawFrameGenSettings();
+void DrawFrameGenStatus();
 // The View uniform buffer (first 16 KB) of this frame's main view, with View.ClipToPrevClip's offset.
 void FrameGenSetCamera(const float* view, int clipToPrevClipOffset);
 // This frame's depth (UE's, state depth read + shader resource) and our motion vectors (render

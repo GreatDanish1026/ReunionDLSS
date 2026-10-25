@@ -305,7 +305,7 @@ std::map<uint64_t, bool> g_resetByOutput;  // per view
 std::map<uint64_t, uint64_t> g_sizeByOutput;
 bool g_resetAll = true;
 float g_lastJitter[2] = {0, 0};
-unsigned g_lastRender[2] = {0, 0};  // render size of the last view DLSS upscaled
+unsigned g_lastRender[2] = {0, 0}, g_lastOutput[2] = {0, 0};  // sizes of the last view DLSS upscaled
 
 constexpr uint32_t kViewScanFloats = 4096;  // the first 16 KB of the View uniform buffer
 
@@ -576,6 +576,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
     in.renderWidth = rw, in.renderHeight = rh;
     g_lastRender[0] = rw, g_lastRender[1] = rh;
+    g_lastOutput[0] = out.texture.width, g_lastOutput[1] = out.texture.height;
     in.outputWidth = out.texture.width, in.outputHeight = out.texture.height;
     in.jitterX = jitter[0], in.jitterY = jitter[1];
     in.motionScaleX = 1, in.motionScaleY = 1;  // motion.hlsl writes previous minus current in pixels
@@ -774,41 +775,63 @@ void UnregisterUpscaler() {
     reshade::unregister_event<reshade::addon_event::present>(&OnPresent);
 }
 
-void DrawUpscalerOverlay() {
-    bool changed = false;
-    ImGui::SeparatorText("DLSS (replaces TSR)");
-    changed |= ImGui::Checkbox("DLSS on (F9)", &g_set.enabled);
+void SaveAndLog() {
+    g_resetAll = true;
+    SaveSettings();
+    Log("settings: DLSS %s, preset %d, mode %s", g_set.enabled ? "on" : "off", g_set.preset,
+        kDlssModeNames[g_set.mode >= 0 && g_set.mode < kDlssModeCount ? g_set.mode : 0]);
+}
+
+void DrawUpscalerSettings() {
+    ImGui::SeparatorText("DLSS");
+    if (ImGui::Checkbox("DLSS", &g_set.enabled)) SaveAndLog();
+    Help("NVIDIA DLSS in place of the game's TSR upscaler. F9 switches it on and off while playing.");
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", g_set.enabled ? dlss::Status().c_str() : "off: the game's TSR");
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        if (g_set.enabled && !g_error.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_error.c_str());
-        ImGui::TextDisabled("Views upscaled: %llu, left to TSR: %llu",
-                            static_cast<unsigned long long>(g_evaluated.load()),
-                            static_cast<unsigned long long>(g_skipped.load()));
+        if (!g_set.enabled)
+            ImGui::TextDisabled("off: the game's TSR");
+        else if (!g_error.empty())
+            ImGui::TextColored(kWarn, "%s", g_error.c_str());
+        else if (g_lastRender[0])
+            ImGui::TextDisabled("%ux%u to %ux%u", g_lastRender[0], g_lastRender[1], g_lastOutput[0], g_lastOutput[1]);
+        else
+            ImGui::TextDisabled("starts with the next game frame");
     }
-    const char* presets[] = {"Default", "J", "K (transformer, recommended)", "L", "M"};
+
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Mode", &g_set.mode, kDlssModeNames, kDlssModeCount)) SaveAndLog();
+    Help("The resolution DLSS renders at, as a share of the screen's. \"Game's Resolution Scale\" uses the game's "
+         "menu setting; the others override it while DLSS is on.\n\nKeep the game's Secondary Resolution Scale at "
+         "100%, so DLSS outputs the full screen resolution.");
+    if (g_res.failed) {
+        ImGui::SameLine();
+        ImGui::TextColored(kWarn, "%s", g_res.error.c_str());
+    }
+
+    const char* presets[] = {"NVIDIA default", "J", "K (recommended)", "L", "M"};
     const int ids[] = {0, 10, 11, 12, 13};
     int cur = 2;
     for (int i = 0; i < 5; ++i)
         if (ids[i] == g_set.preset) cur = i;
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
-    if (ImGui::Combo("Preset", &cur, presets, 5)) g_set.preset = ids[cur], changed = true;
-    ImGui::SameLine();
-    if (ImGui::Button("Reset history")) g_resetAll = true;
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
-    if (ImGui::Combo("DLSS mode", &g_set.mode, kDlssModeNames, kDlssModeCount)) changed = true;
-    ImGui::SameLine();
-    if (g_res.failed) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_res.error.c_str());
-    else if (g_lastRender[0]) ImGui::TextDisabled("renders at %ux%u", g_lastRender[0], g_lastRender[1]);
-    if (g_set.mode == kModeGame)
-        ImGui::TextDisabled("The game's Resolution Scale sets the render resolution. Keep Secondary Resolution Scale at 100%%.");
-    if (changed) {
-        g_resetAll = true;
-        SaveSettings();
-        Log("settings: DLSS %s, preset %d, mode %s", g_set.enabled ? "on" : "off", g_set.preset,
-            kDlssModeNames[g_set.mode >= 0 && g_set.mode < kDlssModeCount ? g_set.mode : 0]);
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Preset", &cur, presets, 5)) g_set.preset = ids[cur], SaveAndLog();
+    Help("DLSS's model. K is NVIDIA's transformer model, sharpest in motion. A driver override in the NVIDIA App "
+         "takes precedence over this.");
+}
+
+void DrawUpscalerStatus() {
+    ImGui::SeparatorText("DLSS");
+    ImGui::TextDisabled("%s", g_set.enabled ? dlss::Status().c_str() : "off");
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        ImGui::TextDisabled("Views upscaled %llu, left to TSR %llu (menus, other views)",
+                            static_cast<unsigned long long>(g_evaluated.load()),
+                            static_cast<unsigned long long>(g_skipped.load()));
+        if (g_res.var)
+            ImGui::TextDisabled("Resolution scale: %s", g_res.overriding ? "set by the DLSS mode" : "the game's");
     }
+    if (ImGui::Button("Reset DLSS history")) g_resetAll = true;
 }
 
 }  // namespace rd
