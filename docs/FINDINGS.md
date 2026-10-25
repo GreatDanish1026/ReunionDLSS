@@ -98,3 +98,11 @@ order is ClipToPrevClip, ClipToPrevClipWithAA, TemporalAAJitter, so the matrix i
 Lock the offset after a few matching frames; log both matrices to confirm (identity when still).
 Shader compiled with fxc cs_5_1 at build time; ReShade layout: push constants b0 + push descriptors
 t0-t1 and u0; Restore() afterwards; views cached and dropped on destroy_resource.
+
+### Result (0.1.6)
+
+View.ClipToPrevClip is at **byte 2176** of the View uniform buffer (root CBV param 3);
+ClipToPrevClipWithAA at 2240, TemporalAAJitter (this frame, last frame, clip units) at 2304.
+The same layout repeats at +7168 (bytes 9344..9472). ViewToClip's jitter row is at byte 480
+(and 7648), which 0.1.5 wrongly took for TemporalAAJitter. Row-major, row vector * matrix: exact
+identity when still. Computed motion in a slow pan right: +2.3 to +4.9 px x, |y| < 0.4 px; 0 still.
