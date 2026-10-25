@@ -308,29 +308,29 @@ std::map<uint64_t, bool> g_resetByOutput;  // per view
 bool g_resetAll = true;
 float g_lastJitter[2] = {0, 0}, g_lastScale[2] = {0, 0};
 
-void OnDilateVelocity(command_list* cl, ListState& s) {
-    const resource depth = Bound(cl, s.compute, 0, 0);
-    const resource velocity = Bound(cl, s.compute, 1, 0);
-    if (!depth.handle || !velocity.handle) return;
-    g_depthByVelocity[velocity.handle] = depth;
-    if (g_depthByVelocity.size() > 64) g_depthByVelocity.clear();
-}
-
-// ---------------------------------------------------------------- motion vector sampling
+// ---------------------------------------------------------------- texture sampling
 //
-// Diagnostics: about once a second, copies three 64-pixel strips of the motion vector copy
-// (screen center, left, top) to a CPU-readable buffer and logs their decoded values a few frames
-// later, to see what "no motion" looks like in TSR's dilated velocity.
+// Diagnostics: about once a second, copies a 64-pixel strip at the screen center of a few TSR
+// textures (every array layer) to CPU-readable buffers and logs their decoded values a few
+// frames later, to find which one holds the motion vectors and how they're encoded.
 
-constexpr uint32_t kStrip = 64, kStripPitch = 512;  // D3D12 copy placement alignment
+constexpr uint32_t kStrip = 64, kStripPitch = 1024;  // pitch: room for 16 bytes per pixel, 512-aligned
+constexpr uint32_t kMaxLayers = 4;
+
+enum class Decode { Half2, Uint, Unorm4 };
+
 struct Sample {
+    const char* label = "";
+    Decode decode = Decode::Half2;
     resource buffer = {0};
-    uint64_t frame = 0;
+    uint64_t frame = 0, lastFrame = 0;
     bool pending = false;
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0, layers = 1, bytes = 4;
 };
-Sample g_samples[3];
-uint64_t g_presentFrame = 0, g_lastSampleFrame = 0;
+Sample g_samples[3] = {{"TSR closest depth (DilateVelocity u0, rg16f)", Decode::Half2},
+                       {"TSR reprojection (DilateVelocity u2, r32uint array)", Decode::Uint},
+                       {"engine velocity (DilateVelocity t1, rgba16unorm)", Decode::Unorm4}};
+uint64_t g_presentFrame = 0;
 
 float Half(uint16_t h) {
     const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
@@ -341,31 +341,25 @@ float Half(uint16_t h) {
     return sign ? -v : v;
 }
 
-void SampleMotion(command_list* cl, resource tex) {
-    if (g_presentFrame - g_lastSampleFrame < 60) return;
-    Sample* slot = nullptr;
-    for (Sample& sm : g_samples)
-        if (!sm.pending) slot = &sm;
-    if (!slot) return;
+void SampleTexture(command_list* cl, Sample& sm, resource tex, resource_usage state) {
+    if (!tex.handle || sm.pending || g_presentFrame - sm.lastFrame < 60) return;
     device* dev = cl->get_device();
-    if (!slot->buffer.handle &&
-        !dev->create_resource(resource_desc(3 * kStripPitch, memory_heap::readback, resource_usage::copy_dest), nullptr,
-                              resource_usage::copy_dest, &slot->buffer))
+    if (!sm.buffer.handle &&
+        !dev->create_resource(resource_desc(kMaxLayers * kStripPitch, memory_heap::readback, resource_usage::copy_dest),
+                              nullptr, resource_usage::copy_dest, &sm.buffer))
         return;
     const resource_desc d = dev->get_resource_desc(tex);
     const uint32_t w = d.texture.width, h = d.texture.height;
-    const subresource_box boxes[3] = {
-        {w / 2 - kStrip / 2, h / 2, 0, w / 2 + kStrip / 2, h / 2 + 1, 1},
-        {w / 8, h / 2, 0, w / 8 + kStrip, h / 2 + 1, 1},
-        {w / 2 - kStrip / 2, h / 8, 0, w / 2 + kStrip / 2, h / 8 + 1, 1},
-    };
-    cl->barrier(tex, resource_usage::shader_resource_non_pixel, resource_usage::copy_source);
-    for (uint32_t i = 0; i < 3; ++i) cl->copy_texture_to_buffer(tex, 0, &boxes[i], slot->buffer, i * kStripPitch, kStrip, 1);
-    cl->barrier(tex, resource_usage::copy_source, resource_usage::shader_resource_non_pixel);
-    slot->pending = true;
-    slot->frame = g_presentFrame;
-    slot->width = w, slot->height = h;
-    g_lastSampleFrame = g_presentFrame;
+    const uint32_t layers = d.texture.depth_or_layers < kMaxLayers ? d.texture.depth_or_layers : kMaxLayers;
+    const uint32_t levels = d.texture.levels ? d.texture.levels : 1;
+    const subresource_box box = {w / 2 - kStrip / 2, h / 2, 0, w / 2 + kStrip / 2, h / 2 + 1, 1};
+    cl->barrier(tex, state, resource_usage::copy_source);
+    for (uint32_t l = 0; l < layers; ++l)
+        cl->copy_texture_to_buffer(tex, l * levels, &box, sm.buffer, l * kStripPitch, kStrip, 1);
+    cl->barrier(tex, resource_usage::copy_source, state);
+    sm.pending = true;
+    sm.frame = sm.lastFrame = g_presentFrame;
+    sm.width = w, sm.height = h, sm.layers = layers;
 }
 
 void ReadSamples(device* dev) {
@@ -373,25 +367,40 @@ void ReadSamples(device* dev) {
         if (!sm.pending || g_presentFrame - sm.frame < 4) continue;
         sm.pending = false;
         void* data = nullptr;
-        if (!dev->map_buffer_region(sm.buffer, 0, 3 * kStripPitch, map_access::read_only, &data) || !data) continue;
-        const char* names[3] = {"center", "left", "top"};
-        char line[400];
-        int n = snprintf(line, sizeof(line), "motion sample (%ux%u, jitter %.3f %.3f, scale %.0f %.0f):", sm.width, sm.height,
-                         g_lastJitter[0], g_lastJitter[1], g_lastScale[0], g_lastScale[1]);
-        for (int i = 0; i < 3; ++i) {
-            const uint16_t* p = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(data) + i * kStripPitch);
-            float mn[2] = {1e30f, 1e30f}, mx[2] = {-1e30f, -1e30f}, sum[2] = {0, 0};
-            for (uint32_t k = 0; k < kStrip; ++k)
-                for (int c = 0; c < 2; ++c) {
-                    const float v = Half(p[k * 2 + c]);
-                    mn[c] = v < mn[c] ? v : mn[c], mx[c] = v > mx[c] ? v : mx[c], sum[c] += v;
+        if (!dev->map_buffer_region(sm.buffer, 0, kMaxLayers * kStripPitch, map_access::read_only, &data) || !data) continue;
+        for (uint32_t l = 0; l < sm.layers; ++l) {
+            const uint8_t* row = static_cast<const uint8_t*>(data) + l * kStripPitch;
+            char line[700];
+            int n = snprintf(line, sizeof(line), "sample %s %ux%u layer %u (jitter %.3f %.3f): ", sm.label, sm.width,
+                             sm.height, l, g_lastJitter[0], g_lastJitter[1]);
+            for (uint32_t k = 0; k < kStrip; k += 8) {  // every 8th pixel
+                if (sm.decode == Decode::Half2) {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(row) + k * 2;
+                    n += snprintf(line + n, sizeof(line) - n, "(%.4g %.4g) ", Half(p[0]), Half(p[1]));
+                } else if (sm.decode == Decode::Uint) {
+                    const uint32_t v = reinterpret_cast<const uint32_t*>(row)[k];
+                    n += snprintf(line + n, sizeof(line) - n, "%08x=(%.4g %.4g) ", v, Half(static_cast<uint16_t>(v & 0xffff)),
+                                  Half(static_cast<uint16_t>(v >> 16)));
+                } else {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(row) + k * 4;
+                    n += snprintf(line + n, sizeof(line) - n, "(%.5f %.5f %.5f %.5f) ", p[0] / 65535.0, p[1] / 65535.0,
+                                  p[2] / 65535.0, p[3] / 65535.0);
                 }
-            n += snprintf(line + n, sizeof(line) - n, " %s x[%.5g..%.5g avg %.5g] y[%.5g..%.5g avg %.5g];", names[i], mn[0],
-                          mx[0], sum[0] / kStrip, mn[1], mx[1], sum[1] / kStrip);
+                if (n > 600) break;
+            }
+            Log("%s", line);
         }
         dev->unmap_buffer_region(sm.buffer);
-        Log("%s", line);
     }
+}
+
+void OnDilateVelocity(command_list* cl, ListState& s) {
+    SampleTexture(cl, g_samples[2], Bound(cl, s.compute, 0, 1), resource_usage::shader_resource_non_pixel);
+    const resource depth = Bound(cl, s.compute, 0, 0);
+    const resource velocity = Bound(cl, s.compute, 1, 0);
+    if (!depth.handle || !velocity.handle) return;
+    g_depthByVelocity[velocity.handle] = depth;
+    if (g_depthByVelocity.size() > 64) g_depthByVelocity.clear();
 }
 
 void OnRejectShading(command_list* cl, ListState& s) {
@@ -401,7 +410,7 @@ void OnRejectShading(command_list* cl, ListState& s) {
     if (it == g_depthByVelocity.end()) return;
     s.chain.depth = it->second;
     s.chain.motion = CopyInput(cl, velocity, resource_usage::shader_resource_non_pixel, format::r16g16_float, "motion");
-    if (s.chain.motion.handle) SampleMotion(cl, s.chain.motion);
+    if (s.chain.motion.handle) SampleTexture(cl, g_samples[0], s.chain.motion, resource_usage::shader_resource_non_pixel);
     if (g_set.colorSource == 1)
         s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
                                   format::r16g16b16a16_float, "scene color");
@@ -499,6 +508,9 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
     switch (s->computeId) {
         case kTsrDilateVelocity:
             OnDilateVelocity(cl, *s);
+            return false;
+        case kTsrDecimateHistory:  // t0: DilateVelocity's u2, written just before
+            SampleTexture(cl, g_samples[1], Bound(cl, s->compute, 0, 0), resource_usage::shader_resource_non_pixel);
             return false;
         case kTsrRejectShading:
             OnRejectShading(cl, *s);
