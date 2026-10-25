@@ -227,6 +227,26 @@ bool ReadConstants(command_list* cl, const StageState& st, uint32_t param, uint3
     return true;
 }
 
+// The render size from TSR's parameters (root CBV 2, the same in every TSR pass): InputInfo is
+// UE's FScreenPassTextureViewportParameters, with the texture extent at 0, ViewportMin (uint2)
+// at 32 and ViewportSize at 48. The extent is rounded up (Balanced's 2227x1253 view sits in a
+// larger texture), so the view's size is used. False if the view doesn't start at 0, 0.
+bool RenderSize(command_list* cl, const StageState& st, float out[2]) {
+    float extent[2] = {0, 0}, size[2] = {0, 0};
+    uint32_t min[2] = {1, 1};
+    if (!ReadConstants(cl, st, 2, 0, extent, 2) || !ReadConstants(cl, st, 2, 48, size, 2) ||
+        !ReadConstants(cl, st, 2, 32, reinterpret_cast<float*>(min), 2))
+        return false;
+    if (min[0] || min[1] || !(size[0] >= 16 && size[1] >= 16 && size[0] <= extent[0] && size[1] <= extent[1])) {
+        static int logged = 0;
+        if (logged++ < 5)
+            Log("TSR view %.0fx%.0f at %u,%u in %.0fx%.0f: not upscaled", size[0], size[1], min[0], min[1], extent[0], extent[1]);
+        return false;
+    }
+    out[0] = size[0], out[1] = size[1];
+    return true;
+}
+
 // Textures of our own that keep copies of transient TSR inputs until DLSS runs. Kept in the
 // non-pixel shader resource state between uses. Never destroyed while the game runs (a texture
 // may still be used by command lists the GPU hasn't run yet): one per size and format.
@@ -459,7 +479,7 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
         return {0};
     }
     float size[2] = {0, 0}, jitter[2] = {0, 0};
-    if (!ReadConstants(cl, s.compute, 2, 0, size, 2) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2) ||
+    if (!RenderSize(cl, s.compute, size) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2) ||
         size[0] < 16 || size[1] < 16 || size[0] > dd.texture.width || size[1] > dd.texture.height ||
         std::fabs(jitter[0]) > 0.5f || std::fabs(jitter[1]) > 0.5f) {
         LogOnce(badParams, "motion: DilateVelocity parameters not usable (size %u x %u)", static_cast<uint32_t>(size[0]),
@@ -557,7 +577,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
         return false;
     }
     float common[2] = {0, 0}, jitter[2] = {0, 0};
-    if (!ReadConstants(cl, s.compute, 2, 0, common, 2) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2)) {
+    if (!RenderSize(cl, s.compute, common) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2)) {
         g_error = "TSR parameters not readable";
         ++g_skipped;
         return false;

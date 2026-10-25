@@ -60,7 +60,9 @@ UpdateHistory). The depth and the output stay valid at ResolveHistory (depth in 
 output in `uav`).
 
 TSR's common parameters (each pass's root CBV param 2, the same first ~300 bytes):
-offset 0 render size (2496, 1404), 112 history size (7680, 4320), 128 output (3840, -2160 ...),
+offset 0 render texture extent (2496, 1404), 32 ViewportMin (uint2), 48 ViewportSize (the render
+size: at Balanced 58% the view is 2227x1253 inside a larger extent; InputInfo is UE's
+FScreenPassTextureViewportParameters, 112 bytes), 112 history size (7680, 4320), 128 output (3840, -2160 ...),
 **256 jitter in render pixels** (Halton(2,3) - 0.5: frame N `-0.4375, 0.388889`, N+1 `0.0625,
 -0.462963`), **272 ScreenVelocityToInputPixelVelocity (1248, -702)**, then its inverse.
 
