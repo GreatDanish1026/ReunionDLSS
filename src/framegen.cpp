@@ -1,9 +1,13 @@
 // DLSS Frame Generation through NVIDIA Streamline 2.14.16 (manual hooking).
 //
-// Streamline's frame generation lives in a proxy swapchain. When the game's D3D12 device is
-// created, Streamline is loaded from Win64\streamline\ (signature checked) and the real DXGI
-// factory's CreateSwapChain / CreateSwapChainForHwnd are hooked, so the swapchain the game gets
-// is Streamline's proxy. Its Present is hooked too: that's where each game frame ends (Reflex
+// Streamline's frame generation lives in a proxy swapchain. When a D3D12 device is created, the
+// real DXGI factory's CreateSwapChain / CreateSwapChainForHwnd are hooked. When the game creates
+// its swapchain, Streamline is loaded from Win64\streamline\ (signature checked) for the device
+// of that swapchain's queue, and the swapchain the game gets is Streamline's proxy.
+//
+// ReShade loads add-ons per device and unloads them when the last one is destroyed: UE creates
+// and destroys a test device at startup, so this add-on is loaded twice. Every hook is removed
+// when it unloads, and Streamline is only started for the swapchain (the real device). Its Present is hooked too: that's where each game frame ends (Reflex
 // latency markers, the frame token, frame generation on or off).
 //
 // Per frame, at the point DLSS upscales (upscaler.cpp), the depth, our motion vectors and the
@@ -194,15 +198,37 @@ void AfterPresent() {
 
 // ---------------------------------------------------------------- vtable hooks
 
-bool Patch(void* object, int slot, void* hook, void** original) {
-    void** vtable = *static_cast<void***>(object);
-    if (vtable[slot] == hook) return true;  // already ours
+struct PatchRecord {
+    void** entry;
+    void* hook;
+    void* original;
+};
+PatchRecord g_patches[8];
+int g_patchCount = 0;
+
+void Write(void** entry, void* value) {
     DWORD old = 0;
-    if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_READWRITE, &old)) return false;
-    *original = vtable[slot];
-    vtable[slot] = hook;
-    VirtualProtect(&vtable[slot], sizeof(void*), old, &old);
+    if (!VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &old)) return;
+    *entry = value;
+    VirtualProtect(entry, sizeof(void*), old, &old);
+}
+
+bool Patch(void* object, int slot, void* hook, void** original) {
+    void** entry = &(*static_cast<void***>(object))[slot];
+    for (int i = 0; i < g_patchCount; ++i)
+        if (g_patches[i].entry == entry && *entry == hook) return true;  // already ours
+    if (g_patchCount == 8) return false;
+    *original = *entry;
+    g_patches[g_patchCount++] = {entry, hook, *original};
+    Write(entry, hook);
     return true;
+}
+
+// Puts the vtables back (only entries that still point at our hooks).
+void Unpatch() {
+    for (int i = g_patchCount - 1; i >= 0; --i)
+        if (*g_patches[i].entry == g_patches[i].hook) Write(g_patches[i].entry, g_patches[i].original);
+    g_patchCount = 0;
 }
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -246,6 +272,33 @@ bool CalledFromStreamline(void* returnAddress) {
 
 thread_local bool t_creating = false;
 
+bool InitStreamline(ID3D12Device* device, std::string& error);
+
+// Starts Streamline (once) for the device of the queue the game creates its swapchain on.
+bool EnsureStreamline(IUnknown* queueOrDevice) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_initTried) return g_ready;
+    ID3D12CommandQueue* queue = nullptr;
+    if (!queueOrDevice || FAILED(queueOrDevice->QueryInterface(IID_PPV_ARGS(&queue)))) return false;  // not D3D12
+    g_initTried = true;
+    ID3D12Device* device = nullptr;
+    const HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
+    queue->Release();
+    std::string err;
+    if (FAILED(hr) || !device) err = "couldn't get the swapchain's device";
+    else if (!InitStreamline(device, err)) device->Release(), device = nullptr;
+    if (!device) {
+        g_status = err;
+        Log("frame generation: %s", err.c_str());
+        return false;
+    }
+    device->Release();  // the game keeps it alive
+    g_ready = true;
+    g_status = "ready";
+    Log("frame generation: Streamline 2.14 started for the game's swapchain");
+    return true;
+}
+
 // Hands the game Streamline's proxy instead of the swapchain just created on a D3D12 queue.
 template <typename T>
 void Upgrade(IUnknown* queueOrDevice, T** swapchain) {
@@ -271,8 +324,9 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DX
     void* caller = _ReturnAddress();
     if (t_creating || CalledFromStreamline(caller)) return g_createSwapChain(f, dev, desc, out);
     t_creating = true;
+    const bool sl = EnsureStreamline(dev);
     const HRESULT hr = g_createSwapChain(f, dev, desc, out);
-    if (SUCCEEDED(hr) && dev) Upgrade(dev, out);
+    if (SUCCEEDED(hr) && sl) Upgrade(dev, out);
     t_creating = false;
     return hr;
 }
@@ -282,8 +336,9 @@ HRESULT STDMETHODCALLTYPE HookCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWN
     void* caller = _ReturnAddress();
     if (t_creating || CalledFromStreamline(caller)) return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
     t_creating = true;
+    const bool sl = EnsureStreamline(dev);
     const HRESULT hr = g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
-    if (SUCCEEDED(hr) && dev) Upgrade(dev, out);
+    if (SUCCEEDED(hr) && sl) Upgrade(dev, out);
     t_creating = false;
     return hr;
 }
@@ -411,27 +466,24 @@ bool InitStreamline(ID3D12Device* device, std::string& error) {
         return false;
     }
     g_frame = 0;
-    return HookFactory(error);
+    return true;
 }
+
+bool g_factoryHooked = false;
 
 void OnInitDevice(device* dev) {
     if (dev->get_api() != device_api::d3d12) return;
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_initTried) return;
-    g_initTried = true;
-    if (!g_set.enabled) {
-        g_status = "off";
-        return;
-    }
+    if (g_factoryHooked || !g_set.enabled) return;
     std::string err;
-    if (!InitStreamline(reinterpret_cast<ID3D12Device*>(dev->get_native()), err)) {
+    if (!HookFactory(err)) {
         g_status = err;
         Log("frame generation: %s", err.c_str());
         return;
     }
-    g_ready = true;
-    g_status = "ready";
-    Log("frame generation: Streamline 2.14 loaded, waiting for the swapchain");
+    g_factoryHooked = true;
+    g_status = "waiting for the game's swapchain";
+    Log("frame generation: swapchain creation hooked");
 }
 
 void OnDestroyDevice(device* dev) {
@@ -441,6 +493,7 @@ void OnDestroyDevice(device* dev) {
     g_ready = false;
     g_sl.shutdown();
     g_status = "shut down";
+    Log("frame generation: Streamline shut down");
 }
 
 }  // namespace
@@ -534,6 +587,7 @@ void RegisterFrameGen() {
 void UnregisterFrameGen() {
     reshade::unregister_event<reshade::addon_event::init_device>(&OnInitDevice);
     reshade::unregister_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
+    Unpatch();  // this add-on's code is about to go away
 }
 
 void DrawFrameGenOverlay() {
@@ -547,8 +601,8 @@ void DrawFrameGenOverlay() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_set.enabled && !g_ready) {
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_initTried && g_status != "off" ? g_status.c_str()
-                                                                                           : "restart the game to load it");
+        ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_initTried || g_factoryHooked ? g_status.c_str()
+                                                                                         : "restart the game to load it");
         return;
     }
     if (!g_ready) {

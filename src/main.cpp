@@ -68,8 +68,13 @@ void OpenLog() {
     if (!n || n >= MAX_PATH) return;
     g_exeDir.assign(path, n);
     g_exeDir.resize(g_exeDir.find_last_of(L"\\/") + 1);
-    g_log = _wfopen((g_exeDir + L"ReunionDLSS.log").c_str(), L"w");
-    Log(RD_PRODUCT " " RD_VERSION " loaded");
+    // ReShade loads add-ons again when the game recreates its device: the same process appends.
+    wchar_t pid[32] = {}, mine[32] = {};
+    swprintf(mine, 32, L"%lu", GetCurrentProcessId());
+    const bool again = GetEnvironmentVariableW(L"REUNIONDLSS_LOG_PID", pid, 32) && wcscmp(pid, mine) == 0;
+    SetEnvironmentVariableW(L"REUNIONDLSS_LOG_PID", mine);
+    g_log = _wfopen((g_exeDir + L"ReunionDLSS.log").c_str(), again ? L"a" : L"w");
+    Log(RD_PRODUCT " " RD_VERSION " loaded%s", again ? " again (same game session)" : "");
 }
 
 std::string Format(const char* fmt, ...) {
