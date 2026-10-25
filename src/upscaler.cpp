@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
+#include "cvars.hpp"
 #include "dlss.hpp"
 #include "motion_cs.h"  // kMotionCs: motion.hlsl compiled by build.ps1
 #include "version.h"
@@ -50,16 +51,19 @@ constexpr int kToggleHotkey = VK_F9;
 struct Settings {
     bool enabled = false;  // remembered across launches
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
+    int mode = 0;          // DlssMode: 0 leaves the render resolution to the game's Resolution Scale
 } g_set;
 
 void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::get_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
 }
 
 void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
     reshade::set_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
 }
 
 // ---------------------------------------------------------------- per command list bindings
@@ -298,6 +302,7 @@ std::string g_error;
 std::map<uint64_t, bool> g_resetByOutput;  // per view
 bool g_resetAll = true;
 float g_lastJitter[2] = {0, 0};
+unsigned g_lastRender[2] = {0, 0};  // render size of the last view DLSS upscaled
 
 constexpr uint32_t kViewScanFloats = 4096;  // the first 16 KB of the View uniform buffer
 
@@ -562,6 +567,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.depth = reinterpret_cast<ID3D12Resource*>(chain.depth.handle);
     in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
     in.renderWidth = rw, in.renderHeight = rh;
+    g_lastRender[0] = rw, g_lastRender[1] = rh;
     in.outputWidth = out.texture.width, in.outputHeight = out.texture.height;
     in.jitterX = jitter[0], in.jitterY = jitter[1];
     in.motionScaleX = 1, in.motionScaleY = 1;  // motion.hlsl writes previous minus current in pixels
@@ -623,7 +629,94 @@ void OnDestroyDevice(device* dev) {
 
 bool g_keyWasDown = false;
 
+// ---------------------------------------------------------------- render resolution (DLSS mode)
+//
+// DLSS renders at the game's r.ScreenPercentage (the menu's Resolution Scale). A DLSS mode sets
+// it to NVIDIA's ratio for that mode while DLSS is on, and puts the game's value back when DLSS is
+// off (so TSR gets the menu's). The game sets it again when its menu is applied: that value is
+// remembered as the game's and the mode's put back.
+
+enum DlssMode { kModeGame, kModeDlaa, kModeQuality, kModeBalanced, kModePerformance, kModeUltraPerformance, kDlssModeCount };
+const char* const kDlssModeNames[kDlssModeCount] = {"Game's Resolution Scale", "DLAA (100%)", "Quality (67%)",
+                                                    "Balanced (58%)", "Performance (50%)", "Ultra Performance (33%)"};
+const float kDlssModePercent[kDlssModeCount] = {0, 100, 66.667f, 58, 50, 33.333f};
+
+struct Resolution {
+    void* manager = nullptr;
+    void* var = nullptr;  // r.ScreenPercentage
+    int sinkFlag = -1;
+    bool failed = false;
+    bool overriding = false;
+    float gameValue = 0, ourValue = 0;
+    uint64_t presents = 0;
+    std::string error;
+} g_res;
+
+bool FindScreenPercentage() {
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    void** singleton = cvars::FindConsoleManagerSingleton(base);
+    void* manager = nullptr;
+    if (singleton) cvars::SafeCopy(&manager, singleton, 8);
+    if (!manager || !cvars::HasModuleVtable(base, manager)) {
+        g_res.error = "the game's console variables weren't found";
+        return false;
+    }
+    void* aniso = cvars::FindVariable(manager, L"r.MaxAnisotropy");
+    void* screen = cvars::FindVariable(manager, L"r.ScreenPercentage");
+    float value = -1;
+    if (!aniso || !screen || !cvars::HasModuleVtable(base, screen) || !cvars::FindTypeSlots(aniso, screen) ||
+        !cvars::GetFloat(screen, value) || !(value >= 10 && value <= 400)) {
+        g_res.error = "r.ScreenPercentage didn't look right (see the log)";
+        Log("DLSS mode: r.ScreenPercentage %p reads %g: not used", screen, value);
+        return false;
+    }
+    g_res.manager = manager, g_res.var = screen;
+    g_res.sinkFlag = cvars::FindSinkFlagOffset(manager);
+    Log("DLSS mode: r.ScreenPercentage found (now %g)", value);
+    return true;
+}
+
+bool SetScreenPercentage(float v) {
+    wchar_t text[32];
+    swprintf(text, 32, L"%.3f", v);
+    if (!cvars::Set(g_res.var, text)) return false;
+    if (g_res.sinkFlag >= 0) cvars::RequestSinks(g_res.manager, g_res.sinkFlag);
+    g_res.ourValue = v;
+    return true;
+}
+
+// About twice a second, on ReShade's present.
+void UpdateResolution() {
+    if (++g_res.presents % 30 != 0) return;
+    const bool want = g_set.enabled && g_set.mode > kModeGame && g_set.mode < kDlssModeCount;
+    if (!g_res.var) {
+        if (!want || g_res.failed) return;
+        if (!FindScreenPercentage()) {
+            g_res.failed = true;
+            return;
+        }
+    }
+    float now = 0;
+    if (!cvars::GetFloat(g_res.var, now)) return;
+    if (want) {
+        const float target = kDlssModePercent[g_set.mode];
+        if (!g_res.overriding) {
+            g_res.gameValue = now, g_res.overriding = true;
+        } else if (std::fabs(now - g_res.ourValue) > 0.01f) {
+            g_res.gameValue = now;  // the game's menu set it again
+            Log("DLSS mode: the game set its resolution scale to %g%%", now);
+        }
+        if (std::fabs(now - target) > 0.01f && SetScreenPercentage(target))
+            Log("DLSS mode %s: render resolution %g%% (the game's: %g%%)", kDlssModeNames[g_set.mode], target, g_res.gameValue);
+    } else if (g_res.overriding) {
+        g_res.overriding = false;
+        if (std::fabs(now - g_res.ourValue) < 0.01f && SetScreenPercentage(g_res.gameValue))
+            Log("DLSS mode: back to the game's resolution scale (%g%%)", g_res.gameValue);
+    }
+}
+
 void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+    UpdateResolution();
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
@@ -695,10 +788,18 @@ void DrawUpscalerOverlay() {
     if (ImGui::Combo("Preset", &cur, presets, 5)) g_set.preset = ids[cur], changed = true;
     ImGui::SameLine();
     if (ImGui::Button("Reset history")) g_resetAll = true;
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
+    if (ImGui::Combo("DLSS mode", &g_set.mode, kDlssModeNames, kDlssModeCount)) changed = true;
+    ImGui::SameLine();
+    if (g_res.failed) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_res.error.c_str());
+    else if (g_lastRender[0]) ImGui::TextDisabled("renders at %ux%u", g_lastRender[0], g_lastRender[1]);
+    if (g_set.mode == kModeGame)
+        ImGui::TextDisabled("The game's Resolution Scale sets the render resolution. Keep Secondary Resolution Scale at 100%%.");
     if (changed) {
         g_resetAll = true;
         SaveSettings();
-        Log("settings: DLSS %s, preset %d", g_set.enabled ? "on" : "off", g_set.preset);
+        Log("settings: DLSS %s, preset %d, mode %s", g_set.enabled ? "on" : "off", g_set.preset,
+            kDlssModeNames[g_set.mode >= 0 && g_set.mode < kDlssModeCount ? g_set.mode : 0]);
     }
 }
 
