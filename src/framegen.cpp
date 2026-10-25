@@ -72,6 +72,7 @@ struct SlApi {
     PFun_slDLSSGSetOptions* dlssgSetOptions = nullptr;
     PFun_slDLSSGGetState* dlssgGetState = nullptr;
     PFun_slReflexSetOptions* reflexSetOptions = nullptr;
+    PFun_slReflexGetState* reflexGetState = nullptr;
     PFun_slReflexSleep* reflexSleep = nullptr;
     PFun_slPCLSetMarker* pclSetMarker = nullptr;
 } g_sl;
@@ -183,7 +184,24 @@ void BeforePresent() {
     // The overlay's status, read here: Streamline wants it read on the presenting thread.
     if (g_sl.dlssgGetState && g_presents % 30 == 0) {
         sl::DLSSGState st{};
-        if (g_sl.dlssgGetState(sl::ViewportHandle(0), st, nullptr) == sl::Result::eOk) g_state = st;
+        if (g_sl.dlssgGetState(sl::ViewportHandle(0), st, nullptr) == sl::Result::eOk) {
+            if (st.status != g_state.status || st.numFramesActuallyPresented != g_state.numFramesActuallyPresented ||
+                g_presents == 30) {
+                sl::ReflexState rs{};
+                const bool reflex = g_sl.reflexGetState && g_sl.reflexGetState(rs) == sl::Result::eOk;
+                Log("frame generation state: %s, %u frame(s) presented per game frame, status 0x%x%s%s%s%s%s, min size %u, "
+                    "max generated %u; Reflex low latency %s",
+                    g_fgOn ? "on" : "off", st.numFramesActuallyPresented, static_cast<unsigned>(st.status),
+                    (static_cast<unsigned>(st.status) & 1) ? " resolution-too-low" : "",
+                    (static_cast<unsigned>(st.status) & 2) ? " reflex-not-detected" : "",
+                    (static_cast<unsigned>(st.status) & 4) ? " hdr-format-not-supported" : "",
+                    (static_cast<unsigned>(st.status) & 8) ? " constants-invalid" : "",
+                    (static_cast<unsigned>(st.status) & 16) ? " GetCurrentBackBufferIndex-not-called" : "",
+                    st.minWidthOrHeight, st.numFramesToGenerateMax,
+                    !reflex ? "unknown" : rs.lowLatencyAvailable ? "available" : "NOT available");
+            }
+            g_state = st;
+        }
     }
     Marker(sl::PCLMarker::ePresentStart);
 }
@@ -461,6 +479,7 @@ bool InitStreamline(ID3D12Device* device, std::string& error) {
     Feature(sl::kFeatureDLSS_G, g_sl.dlssgGetState, "slDLSSGGetState");
     Feature(sl::kFeatureReflex, g_sl.reflexSetOptions, "slReflexSetOptions");
     Feature(sl::kFeatureReflex, g_sl.reflexSleep, "slReflexSleep");
+    Feature(sl::kFeatureReflex, g_sl.reflexGetState, "slReflexGetState");
     Feature(sl::kFeaturePCL, g_sl.pclSetMarker, "slPCLSetMarker");
     if (!g_sl.dlssgSetOptions || !g_sl.reflexSetOptions || !g_sl.pclSetMarker) {
         error = "Streamline features missing (see the log)";
