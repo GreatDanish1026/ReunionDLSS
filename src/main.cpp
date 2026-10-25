@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "version.h"
+#include "../third_party/reshade/utils/descriptor_tracking.hpp"
 
 extern "C" __declspec(dllexport) const char* NAME = RD_PRODUCT;
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS for " RD_GAME " (in development: frame capture only).";
@@ -389,13 +390,70 @@ void OnPushDescriptors(command_list* cl, shader_stage stages, pipeline_layout, u
             DumpConstants(cl, param, static_cast<const buffer_range*>(u.descriptors)[i]);
 }
 
-void OnBindTables(command_list* cl, shader_stage stages, pipeline_layout, uint32_t first, uint32_t count,
+char RegisterLetter(descriptor_type t) {
+    switch (t) {
+        case descriptor_type::sampler: return 's';
+        case descriptor_type::constant_buffer: return 'b';
+        case descriptor_type::buffer_unordered_access_view:
+        case descriptor_type::texture_unordered_access_view: return 'u';
+        default: return 't';
+    }
+}
+
+// The resources in a TSR pass's descriptor tables, by shader register.
+void ResolveTables(command_list* cl, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table* tables) {
+    device* dev = cl->get_device();
+    descriptor_tracking* dt = dev->get_private_data<descriptor_tracking>();
+    if (!dt) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        const pipeline_layout_param p = dt->get_pipeline_layout_param(layout, first + i);
+        if (p.type != pipeline_layout_param_type::descriptor_table || !p.descriptor_table.ranges) {
+            Add(cl, Format("  table param %u: layout unknown (type %u)", first + i, static_cast<uint32_t>(p.type)));
+            continue;
+        }
+        for (uint32_t r = 0; r < p.descriptor_table.count; ++r) {
+            const descriptor_range& range = p.descriptor_table.ranges[r];
+            const uint32_t n = range.count > 48 ? 48 : range.count;  // unbounded ranges: the first 48
+            for (uint32_t k = 0; k < n; ++k) {
+                descriptor_heap heap = {0};
+                uint32_t offset = 0;
+                dev->get_descriptor_heap_offset(tables[i], range.binding + k, 0, &heap, &offset);
+                std::string what;
+                if (range.type == descriptor_type::sampler) continue;
+                if (range.type == descriptor_type::constant_buffer) {
+                    const buffer_range b = dt->get_buffer_range(heap, offset);
+                    if (!b.buffer.handle) continue;
+                    what = Format("cbv %s +%llu", Describe(dev, b.buffer).c_str(), b.offset);
+                } else {
+                    const resource_view v = dt->get_resource_view(heap, offset);
+                    if (!v.handle) continue;
+                    const resource_view_desc vd = dev->get_resource_view_desc(v);
+                    what = Describe(dev, dev->get_resource_from_view(v));
+                    if (const char* fn = FormatName(vd.format)) what += Format(" as %s", fn);
+                }
+                Add(cl, Format("  table param %u: %c%u space%u = %s", first + i, RegisterLetter(range.type),
+                               range.dx_register_index + k, range.dx_register_space, what.c_str()));
+            }
+        }
+    }
+}
+
+void OnBindTables(command_list* cl, shader_stage stages, pipeline_layout layout, uint32_t first, uint32_t count,
                   const descriptor_table* tables, uint32_t, const uint32_t*) {
     if (!Recording()) return;
-    const char* st = (stages & shader_stage::compute) != 0 ? "cs" : "gfx";
+    const bool compute = (stages & shader_stage::compute) != 0;
+    const char* st = compute ? "cs" : "gfx";
     std::string s = Format("tables %s %u..%u:", st, first, first + count - 1);
     for (uint32_t i = 0; i < count && i < 8; ++i) s += Format(" %llx", tables[i].handle);
     Add(cl, s);
+    if (!compute) return;
+    bool tsr;
+    {
+        std::lock_guard<std::mutex> lock(g_capMutex);
+        auto it = g_listPipe.find(cl->get_native());
+        tsr = it != g_listPipe.end() && IsTsr(it->second);
+    }
+    if (tsr) ResolveTables(cl, layout, first, count, tables);
 }
 
 void OnBindRenderTargets(command_list* cl, uint32_t count, const resource_view* rtvs, resource_view dsv) {
@@ -513,6 +571,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             if (!reshade::register_addon(module)) return FALSE;
             g_loadTick = GetTickCount64();
             OpenLog();
+            descriptor_tracking::register_events();
             reshade::register_event<reshade::addon_event::init_pipeline>(&OnInitPipeline);
             reshade::register_event<reshade::addon_event::destroy_pipeline>(&OnDestroyPipeline);
             reshade::register_event<reshade::addon_event::reset_command_list>(&OnReset);
@@ -533,6 +592,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_overlay(RD_PRODUCT, &DrawOverlay);
             break;
         case DLL_PROCESS_DETACH:
+            descriptor_tracking::unregister_events();
             reshade::unregister_addon(module);
             if (g_log) fclose(g_log);
             break;

@@ -24,7 +24,7 @@ $cmd = @(
     "call `"$vcvars`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
      "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" " +
-     "/Fo`"$obj\\`" `"$root\src\main.cpp`" user32.lib " +
+     "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" user32.lib " +
      "/link /DLL /OUT:`"$addon`" /PDB:`"$obj\ReunionDLSS.pdb`" /DEBUG")
 ) -join " && "
 cmd /c $cmd

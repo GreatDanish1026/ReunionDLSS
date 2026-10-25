@@ -44,3 +44,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+----------------------------------------------------------------------------
+ReShade descriptor tracking (third_party/reshade/utils)
+----------------------------------------------------------------------------
+From ReShade 6.8.0 examples/utils, Copyright (C) 2021 Patrick Mours,
+BSD-3-Clause OR MIT (see third_party/reshade/LICENSE.md). Modified (see the
+note at the top of descriptor_tracking.cpp).
+
+----------------------------------------------------------------------------
+NVIDIA DLSS SDK 310.9.16 (third_party/dlss)
+----------------------------------------------------------------------------
+Headers and nvsdk_ngx_s.lib from https://github.com/NVIDIA/DLSS (tag
+v310.9.16), under the NVIDIA RTX SDKs license (third_party/dlss/LICENSE.txt).
+This software contains source code provided by NVIDIA Corporation.
