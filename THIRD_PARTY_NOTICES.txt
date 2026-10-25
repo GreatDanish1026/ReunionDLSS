@@ -58,3 +58,48 @@ NVIDIA DLSS SDK 310.9.16 (third_party/dlss)
 Headers and nvsdk_ngx_s.lib from https://github.com/NVIDIA/DLSS (tag
 v310.9.16), under the NVIDIA RTX SDKs license (third_party/dlss/LICENSE.txt).
 This software contains source code provided by NVIDIA Corporation.
+
+
+----------------------------------------------------------------------------
+NVIDIA Streamline SDK 2.14.16 (third_party/streamline)
+https://github.com/NVIDIA-RTX/Streamline
+----------------------------------------------------------------------------
+Headers from the release zip (tag v2.14.16). The NVIDIA-signed runtime files
+(sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll,
+nvngx_dlssg.dll) are copied into the game's Win64\streamline folder by
+build.ps1 -Install and are not part of the repository; Reflex is under
+reflex.license.txt from the same release.
+
+/*
+* Copyright (c) 2023 NVIDIA CORPORATION. All rights reserved
+*
+* Permission is hereby granted, free of charge, to any person obtaining a copy
+* of this software and associated documentation files (the "Software"), to deal
+* in the Software without restriction, including without limitation the rights
+* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+* copies of the Software, and to permit persons to whom the Software is
+* furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in all
+* copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+* SOFTWARE.
+*/
+
+/*
+*  NSight Perf SDK License, Version 2023.3
+*  Please see the file included in this package
+*  "NVIDIA Nsight Perf SDK License (28Sept2022).pdf" for licensing details
+*  of the NSight Perf SDK.
+*  NSight Perf SDK ver 2023.3 can be downloaded from here:
+*  https://developer.nvidia.com/gameworksdownload#?dn=nsight-perf-sdk-2023-3
+*  The Streamline files covered by the NSight Perf SDK License are:
+*  sl_nvperf.h
+*  sl_nvperf.dll
+*/
