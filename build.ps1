@@ -1,8 +1,16 @@
 # Builds bin\ReunionDLSS.addon64 with MSVC (Visual Studio 2022+ with C++ tools).
 # MSVC is required: ReShade is built with it, and MinGW returns API structs differently.
-# Usage: .\build.ps1 [-Install] [-GameBin <folder of Iris-Win64-Shipping.exe>]
+# Usage: .\build.ps1 [-Install] [-Package] [-GameBin <folder of Iris-Win64-Shipping.exe>]
+#   -Install  copies the add-on, nvngx_dlss.dll and the Streamline runtime (in a streamline folder)
+#             next to the game's exe (game closed).
+#   -Package  makes bin\release\ReunionDLSS-<version>.zip: the add-on and the NVIDIA runtime laid
+#             out as in the game folder, README, LICENSE, THIRD_PARTY_NOTICES and NVIDIA's licences.
+# The NVIDIA runtime comes from third_party\streamline\bin\x64: bin\x64 of NVIDIA's Streamline
+# SDK release 2.14.16 (github.com/NVIDIA-RTX/Streamline/releases), which also carries
+# nvngx_dlss.dll 310.9.16. Those DLLs aren't in this repository.
 param(
     [switch]$Install,
+    [switch]$Package,
     [string]$GameBin = "E:\SteamLibrary\steamapps\common\LifeisStrangeReunion\Iris\Binaries\Win64"
 )
 $ErrorActionPreference = 'Stop'
@@ -33,17 +41,47 @@ cmd /c $cmd
 if ($LASTEXITCODE) { throw "build failed" }
 Write-Host "Built $addon"
 
+# NVIDIA's runtime, all signed: DLSS next to the exe, Streamline (frame generation) in Win64\streamline.
+$sl = "$root\third_party\streamline\bin\x64"
+$slFiles = "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll"
+foreach ($f in @("nvngx_dlss.dll") + $slFiles) {
+    if (($Install -or $Package) -and -not (Test-Path "$sl\$f")) { throw "$f not found in $sl (unzip NVIDIA's Streamline 2.14.16 release there)" }
+}
+
+# Lays out the add-on and the NVIDIA runtime as they go in the game's Win64 folder.
+function Copy-Runtime([string]$dest) {
+    Copy-Item $addon $dest -Force
+    Copy-Item "$sl\nvngx_dlss.dll" $dest -Force
+    New-Item -ItemType Directory -Force "$dest\streamline" | Out-Null
+    foreach ($f in $slFiles) { Copy-Item "$sl\$f" "$dest\streamline" -Force }
+}
+
 if ($Install) {
     if (-not (Test-Path "$GameBin\$exe")) { throw "$exe not found in $GameBin (pass -GameBin)" }
     if (Get-Process ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue) { throw "Close the game first." }
-    Copy-Item $addon $GameBin -Force
-    # Streamline 2.14.16 (NVIDIA-signed) for frame generation: Win64\streamline\
-    $sl = "$root\third_party\streamline\bin\x64"
-    New-Item -ItemType Directory -Force "$GameBin\streamline" | Out-Null
-    foreach ($f in "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll") {
-        Copy-Item "$sl\$f" "$GameBin\streamline" -Force
-    }
+    Copy-Runtime $GameBin
     Copy-Item "$root\third_party\streamline\license.txt" "$GameBin\streamline\streamline.license.txt" -Force
-    Copy-Item "$sl\reflex.license.txt" "$GameBin\streamline" -Force
+    Copy-Item "$root\third_party\streamline\licenses\reflex.license.txt" "$GameBin\streamline" -Force
     Write-Host "Installed to $GameBin"
+}
+
+if ($Package) {
+    $version = [regex]::Match((Get-Content "$root\src\version.h" -Raw), 'RD_VERSION "([^"]+)"').Groups[1].Value
+    $name = "ReunionDLSS-$version"
+    $stage = "$root\bin\release\$name"
+    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+    New-Item -ItemType Directory -Force "$stage\licenses" | Out-Null
+    # Everything at the top level (and the streamline folder) goes next to the game's shipping exe.
+    Copy-Runtime $stage
+    Copy-Item "$root\README.md", "$root\LICENSE", "$root\THIRD_PARTY_NOTICES.txt" $stage
+    Copy-Item "$root\third_party\streamline\license.txt" "$stage\licenses\Streamline-LICENSE.txt"
+    Copy-Item "$root\third_party\streamline\licenses\nvngx_dlss.license.txt" "$stage\licenses\NVIDIA-DLSS-LICENSE.txt"
+    Copy-Item "$root\third_party\streamline\licenses\reflex.license.txt" "$stage\licenses\NVIDIA-Reflex-LICENSE.txt"
+    $zip = "$root\bin\release\$name.zip"
+    if (Test-Path $zip) { Remove-Item -Force $zip }
+    Compress-Archive -Path "$stage\*" -DestinationPath $zip
+    Write-Host "Packaged $zip"
+    Get-ChildItem $stage -Recurse -File | ForEach-Object {
+        "{0,-40} {1,-14} {2,12:N0}" -f $_.FullName.Substring($stage.Length + 1), $_.VersionInfo.FileVersion, $_.Length
+    }
 }

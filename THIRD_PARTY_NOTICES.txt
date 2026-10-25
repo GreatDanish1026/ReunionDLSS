@@ -64,11 +64,14 @@ This software contains source code provided by NVIDIA Corporation.
 NVIDIA Streamline SDK 2.14.16 (third_party/streamline)
 https://github.com/NVIDIA-RTX/Streamline
 ----------------------------------------------------------------------------
-Headers from the release zip (tag v2.14.16). The NVIDIA-signed runtime files
-(sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll,
-nvngx_dlssg.dll) are copied into the game's Win64\streamline folder by
-build.ps1 -Install and are not part of the repository; Reflex is under
-reflex.license.txt from the same release.
+Headers from the SDK release (tag v2.14.16).
+
+The ReunionDLSS release zip redistributes NVIDIA-signed runtime files from that
+same release, unmodified: nvngx_dlss.dll (DLSS 310.9.16) and, in the streamline
+folder, sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll,
+sl.pcl.dll and nvngx_dlssg.dll. Their licences are in the zip's licenses folder:
+Streamline-LICENSE.txt (below), NVIDIA-DLSS-LICENSE.txt and
+NVIDIA-Reflex-LICENSE.txt. They are not part of the source repository.
 
 /*
 * Copyright (c) 2023 NVIDIA CORPORATION. All rights reserved

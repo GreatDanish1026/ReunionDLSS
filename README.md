@@ -26,21 +26,28 @@ Settings are in ReShade's Add-ons tab (Settings and Status) and saved in `ReShad
 
 ## Install
 
-1. Install ReShade 6.8 with add-on support for `Iris-Win64-Shipping.exe`
-   (`Iris\Binaries\Win64`).
-2. Copy `ReunionDLSS.addon64` next to it.
-3. Put NVIDIA's `nvngx_dlss.dll` (310.9.16, signed) next to it.
-4. For frame generation, put the Streamline 2.14.16 runtime in a `streamline` folder next to
-   it: `sl.interposer.dll`, `sl.common.dll`, `sl.dlss_g.dll`, `sl.reflex.dll`, `sl.pcl.dll`,
-   `nvngx_dlssg.dll` (all from NVIDIA's Streamline release, signature-checked at start).
+1. Install ReShade 6.8 or later with full add-on support for `Iris-Win64-Shipping.exe`, in
+   `Life is Strange Reunion\Iris\Binaries\Win64`.
+2. Copy everything from the release zip into that `Win64` folder: `ReunionDLSS.addon64`,
+   `nvngx_dlss.dll` and the `streamline` folder (the licence files can go along).
+3. Start the game, open ReShade (Home key), Add-ons tab, ReunionDLSS: switch DLSS on (or press
+   F9), pick a mode and, if you like, frame generation (takes effect after a restart).
+4. In the NVIDIA App, a DLSS model override for the game takes precedence over the Preset.
 
-Logs: `ReunionDLSS.log` next to the game's exe, Streamline's in `streamline\sl.log`.
+The zip includes NVIDIA's DLSS 310.9.16 and Streamline 2.14.16 runtime files, all signed by
+NVIDIA (the add-on checks Streamline's signature before loading it). Their licences are in
+`licenses`, and attribution is in `THIRD_PARTY_NOTICES.txt`.
+
+To uninstall, delete those files. Logs: `ReunionDLSS.log` next to the game's exe, Streamline's
+in `streamline\sl.log`.
 
 ## Build
 
-`.\build.ps1` (Visual Studio 2022 C++ tools, Windows SDK for `fxc`); `.\build.ps1 -Install`
-copies the add-on and the Streamline runtime from `third_party\streamline\bin\x64` (not in the
-repository: unzip NVIDIA's release there) into the game folder, with the game closed.
+`.\build.ps1` (Visual Studio 2022 C++ tools, Windows SDK for `fxc`). The NVIDIA runtime isn't in
+the repository: unzip `bin\x64` of NVIDIA's Streamline 2.14.16 release into
+`third_party\streamline\bin\x64` first. `.\build.ps1 -Install` copies the add-on and the runtime
+into the game folder (game closed); `.\build.ps1 -Package` makes the release zip in
+`bin\release`.
 
 ## How it works
 
