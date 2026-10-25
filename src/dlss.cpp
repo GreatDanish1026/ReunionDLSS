@@ -12,7 +12,9 @@
 #include <nvsdk_ngx_helpers_d3d.h>
 
 #include <cstdio>
+#include <map>
 #include <mutex>
+#include <vector>
 
 namespace dlss {
 namespace {
@@ -25,11 +27,27 @@ ID3D12Device* g_device = nullptr;
 bool g_initTried = false, g_ready = false;
 std::string g_initError;
 NVSDK_NGX_Parameter* g_params = nullptr;
-NVSDK_NGX_Handle* g_feature = nullptr;
-unsigned g_fRenderW = 0, g_fRenderH = 0, g_fOutW = 0, g_fOutH = 0;
-int g_fPreset = -1;
-NVSDK_NGX_PerfQuality_Value g_fQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
 std::string g_status = "not started";
+
+// One DLSS feature (and so one history) per output: the game renders more than one TSR view.
+struct Feature {
+    NVSDK_NGX_Handle* handle = nullptr;
+    unsigned renderW = 0, renderH = 0, outW = 0, outH = 0;
+    int preset = -1;
+    NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+};
+constexpr size_t kMaxFeatures = 4;
+std::map<ID3D12Resource*, Feature> g_features;
+
+// A replaced feature may still be used by command lists the GPU hasn't run yet, so it's released
+// only some frames later.
+struct Retired {
+    NVSDK_NGX_Handle* handle;
+    uint64_t frame;
+};
+std::vector<Retired> g_retired;
+uint64_t g_frame = 0;
+constexpr uint64_t kRetireFrames = 8;
 
 void NVSDK_CONV NgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
     std::string m = message ? message : "";
@@ -73,13 +91,9 @@ NVSDK_NGX_PerfQuality_Value PickQuality(unsigned renderW, unsigned renderH, unsi
     return NVSDK_NGX_PerfQuality_Value_MaxQuality;
 }
 
-void ReleaseFeature() {
-    if (g_feature) NVSDK_NGX_D3D12_ReleaseFeature(g_feature);
-    g_feature = nullptr;
-}
-
-bool CreateFeature(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& error) {
-    ReleaseFeature();
+bool CreateFeature(ID3D12GraphicsCommandList* list, const Inputs& in, Feature& f, std::string& error) {
+    if (f.handle) g_retired.push_back({f.handle, g_frame});
+    f.handle = nullptr;
     const NVSDK_NGX_PerfQuality_Value q = PickQuality(in.renderWidth, in.renderHeight, in.outputWidth, in.outputHeight);
     const char* presetKeys[] = {
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,        NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
@@ -95,16 +109,17 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Inputs& in, std::strin
     cp.Feature.InPerfQualityValue = q;
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                               NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-    const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(list, 1, 1, &g_feature, g_params, &cp);
+    const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(list, 1, 1, &f.handle, g_params, &cp);
     if (NVSDK_NGX_FAILED(r)) {
-        g_feature = nullptr;
+        f.handle = nullptr;
         error = "DLSS feature creation failed (" + ResultText(r) + ")";
         return false;
     }
-    g_fRenderW = in.renderWidth, g_fRenderH = in.renderHeight, g_fOutW = in.outputWidth, g_fOutH = in.outputHeight;
-    g_fPreset = in.preset, g_fQuality = q;
-    rd::Log("DLSS feature created: %ux%u -> %ux%u, %s mode, preset %d", in.renderWidth, in.renderHeight, in.outputWidth,
-            in.outputHeight, QualityName(q), in.preset);
+    f.renderW = in.renderWidth, f.renderH = in.renderHeight, f.outW = in.outputWidth, f.outH = in.outputHeight;
+    f.preset = in.preset, f.quality = q;
+    rd::Log("DLSS feature created for output %p: %ux%u -> %ux%u, %s mode, preset %d (%zu views)",
+            static_cast<void*>(in.output), in.renderWidth, in.renderHeight, in.outputWidth, in.outputHeight, QualityName(q),
+            in.preset, g_features.size());
     return true;
 }
 
@@ -168,12 +183,20 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
         error = g_initError.empty() ? "DLSS not started" : g_initError;
         return false;
     }
-    if (!g_feature || in.renderWidth != g_fRenderW || in.renderHeight != g_fRenderH || in.outputWidth != g_fOutW ||
-        in.outputHeight != g_fOutH || in.preset != g_fPreset) {
-        if (!CreateFeature(list, in, error)) {
-            g_status = error;
+    auto it = g_features.find(in.output);
+    if (it == g_features.end()) {
+        if (g_features.size() >= kMaxFeatures) {
+            error = "too many TSR views";
             return false;
         }
+        it = g_features.emplace(in.output, Feature()).first;
+    }
+    Feature& f = it->second;
+    const bool fresh = !f.handle || in.renderWidth != f.renderW || in.renderHeight != f.renderH ||
+                       in.outputWidth != f.outW || in.outputHeight != f.outH || in.preset != f.preset;
+    if (fresh && !CreateFeature(list, in, f, error)) {
+        g_status = error;
+        return false;
     }
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
     ep.Feature.pInColor = in.color;
@@ -183,27 +206,45 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
     ep.InJitterOffsetX = in.jitterX;
     ep.InJitterOffsetY = in.jitterY;
     ep.InRenderSubrectDimensions = {in.renderWidth, in.renderHeight};
-    ep.InReset = in.reset ? 1 : 0;
+    ep.InReset = in.reset || fresh ? 1 : 0;
     ep.InMVScaleX = in.motionScaleX;
     ep.InMVScaleY = in.motionScaleY;
     ep.InPreExposure = 1.0f;
     ep.InExposureScale = 1.0f;
-    const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(list, g_feature, g_params, &ep);
+    const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(list, f.handle, g_params, &ep);
     if (NVSDK_NGX_FAILED(r)) {
         error = "DLSS evaluation failed (" + ResultText(r) + ")";
         g_status = error;
         return false;
     }
     char buf[160];
-    snprintf(buf, sizeof(buf), "running: %ux%u -> %ux%u, %s mode, preset %c", g_fRenderW, g_fRenderH, g_fOutW, g_fOutH,
-             QualityName(g_fQuality), g_fPreset ? static_cast<char>('A' + g_fPreset - 1) : 'D');
+    snprintf(buf, sizeof(buf), "running: %ux%u -> %ux%u, %s mode, preset %c, %zu view%s", f.renderW, f.renderH, f.outW,
+             f.outH, QualityName(f.quality), f.preset ? static_cast<char>('A' + f.preset - 1) : 'D', g_features.size(),
+             g_features.size() == 1 ? "" : "s");
     g_status = buf;
     return true;
 }
 
+void EndFrame() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_frame;
+    for (size_t i = 0; i < g_retired.size();) {
+        if (g_frame - g_retired[i].frame < kRetireFrames) {
+            ++i;
+            continue;
+        }
+        NVSDK_NGX_D3D12_ReleaseFeature(g_retired[i].handle);
+        g_retired.erase(g_retired.begin() + i);
+    }
+}
+
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    ReleaseFeature();
+    for (auto& [out, f] : g_features)
+        if (f.handle) NVSDK_NGX_D3D12_ReleaseFeature(f.handle);
+    g_features.clear();
+    for (Retired& r : g_retired) NVSDK_NGX_D3D12_ReleaseFeature(r.handle);
+    g_retired.clear();
     if (g_params) NVSDK_NGX_D3D12_DestroyParameters(g_params);
     g_params = nullptr;
     if (g_ready && g_device) NVSDK_NGX_D3D12_Shutdown1(g_device);

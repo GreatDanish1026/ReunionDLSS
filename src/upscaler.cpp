@@ -45,7 +45,7 @@ namespace {
 constexpr int kToggleHotkey = VK_F9;
 
 struct Settings {
-    bool enabled = false;  // off until switched on in the overlay (or F9)
+    bool enabled = false;  // off at every start until switched on in the overlay (or F9)
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
     bool flipMotionX = false, flipMotionY = false;
     bool flipJitterX = false, flipJitterY = false;
@@ -54,7 +54,8 @@ struct Settings {
 } g_set;
 
 void LoadSettings() {
-    reshade::get_config_value(nullptr, RD_PRODUCT, "Enabled", g_set.enabled);
+    // DLSS always starts off while it's in development (a GPU crash at start can't repeat):
+    // F9 or the overlay switches it on.
     reshade::get_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipMotionX", g_set.flipMotionX);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipMotionY", g_set.flipMotionY);
@@ -101,11 +102,18 @@ struct StageState {
     }
 };
 
+// One TSR run's inputs, gathered in the command list that records RejectShading, UpdateHistory
+// and ResolveHistory (in that order).
+struct Chain {
+    resource depth = {0}, motion = {0}, color = {0};
+};
+
 struct __declspec(uuid("3d0f6b1e-8c42-4a57-b1e9-5a7c0d2f9e61")) ListState {
     pipeline pipe = {0};
     pipeline_stage pipeStages = pipeline_stage::all;
     uint32_t computeId = 0;  // shader id of the bound pipeline (0 if graphics or unknown)
     StageState compute, graphics;
+    Chain chain;
 };
 
 ListState* State(command_list* cl) { return cl->get_private_data<ListState>(); }
@@ -227,133 +235,179 @@ bool ReadConstants(command_list* cl, const StageState& st, uint32_t param, uint3
     return true;
 }
 
-// A texture of our own that keeps a copy of a transient TSR input until DLSS runs. Kept in the
-// non-pixel shader resource state between uses.
-struct Copy {
-    resource tex = {0};
-    resource_desc desc;
+// Textures of our own that keep copies of transient TSR inputs until DLSS runs. Kept in the
+// non-pixel shader resource state between uses. Never destroyed while the game runs (a texture
+// may still be used by command lists the GPU hasn't run yet): one per size and format.
+struct CopyPool {
+    struct Entry {
+        resource_desc desc;
+        resource tex = {0};
+    };
+    std::vector<Entry> entries;
 
-    bool Ensure(device* dev, const resource_desc& src) {
-        if (tex.handle && desc.texture.width == src.texture.width && desc.texture.height == src.texture.height &&
-            desc.texture.format == src.texture.format)
-            return true;
-        if (tex.handle) dev->destroy_resource(tex);
-        tex = {0};
-        desc = resource_desc(src.texture.width, src.texture.height, 1, 1, src.texture.format, 1, memory_heap::default_,
-                             resource_usage::shader_resource | resource_usage::copy_dest);
-        if (!dev->create_resource(desc, nullptr, resource_usage::shader_resource_non_pixel, &tex)) {
-            tex = {0};
+    resource Get(device* dev, const resource_desc& src) {
+        for (const Entry& e : entries)
+            if (e.desc.texture.width == src.texture.width && e.desc.texture.height == src.texture.height &&
+                e.desc.texture.format == src.texture.format)
+                return e.tex;
+        if (entries.size() >= 8) return {0};
+        Entry e;
+        e.desc = resource_desc(src.texture.width, src.texture.height, 1, 1, src.texture.format, 1, memory_heap::default_,
+                               resource_usage::shader_resource | resource_usage::copy_dest);
+        if (!dev->create_resource(e.desc, nullptr, resource_usage::shader_resource_non_pixel, &e.tex)) {
             Log("couldn't create a %ux%u copy texture", src.texture.width, src.texture.height);
-            return false;
+            return {0};
         }
         Log("created %ux%u copy texture (format %u)", src.texture.width, src.texture.height,
             static_cast<uint32_t>(src.texture.format));
-        return true;
-    }
-
-    // Copies <src> (in state <srcState>) into the texture.
-    bool From(command_list* cl, resource src, resource_usage srcState) {
-        device* dev = cl->get_device();
-        if (!src.handle || !Ensure(dev, dev->get_resource_desc(src))) return false;
-        cl->barrier(src, srcState, resource_usage::copy_source);
-        cl->barrier(tex, resource_usage::shader_resource_non_pixel, resource_usage::copy_dest);
-        cl->copy_resource(src, tex);
-        cl->barrier(src, resource_usage::copy_source, srcState);
-        cl->barrier(tex, resource_usage::copy_dest, resource_usage::shader_resource_non_pixel);
-        return true;
+        entries.push_back(e);
+        return e.tex;
     }
 
     void Destroy(device* dev) {
-        if (tex.handle) dev->destroy_resource(tex);
-        tex = {0};
+        for (Entry& e : entries) dev->destroy_resource(e.tex);
+        entries.clear();
     }
 };
 
 std::mutex g_mutex;
-Copy g_motion, g_color;
+CopyPool g_pool;
 
-struct Frame {
-    resource depth = {0};
-    float jitter[2] = {0, 0};
-    float motionScale[2] = {0, 0};  // TSR's ScreenVelocityToInputPixelVelocity
-    float renderSize[2] = {0, 0};
-    bool haveDepth = false, haveMotion = false, haveColor = false;
-} g_frame;
+// Copies <src> (in state <srcState>, format <want>) into a pool texture; {0} if the format isn't
+// the expected one (menus and other views bind other textures in these slots).
+resource CopyInput(command_list* cl, resource src, resource_usage srcState, format want, const char* what) {
+    if (!src.handle) return {0};
+    device* dev = cl->get_device();
+    const resource_desc d = dev->get_resource_desc(src);
+    if (d.type != resource_type::texture_2d || d.texture.format != want) {
+        static int logged = 0;
+        if (logged < 20) {
+            ++logged;
+            Log("%s: unexpected %ux%u format %u: TSR kept for this view", what, d.texture.width, d.texture.height,
+                static_cast<uint32_t>(d.texture.format));
+        }
+        return {0};
+    }
+    const resource tex = g_pool.Get(dev, d);
+    if (!tex.handle) return {0};
+    cl->barrier(src, srcState, resource_usage::copy_source);
+    cl->barrier(tex, resource_usage::shader_resource_non_pixel, resource_usage::copy_dest);
+    cl->copy_resource(src, tex);
+    cl->barrier(src, resource_usage::copy_source, srcState);
+    cl->barrier(tex, resource_usage::copy_dest, resource_usage::shader_resource_non_pixel);
+    return tex;
+}
 
-std::atomic<uint64_t> g_evaluated{0};
+// DilateVelocity writes the dilated velocity (u0) that RejectShading reads (t8), and is recorded
+// in another command list, so its depth is found through that texture.
+std::map<uint64_t, resource> g_depthByVelocity;
+
+std::atomic<uint64_t> g_evaluated{0}, g_skipped{0};
 std::string g_error;
-bool g_reset = true;
-unsigned g_lastRenderW = 0, g_lastRenderH = 0;
+std::map<uint64_t, bool> g_resetByOutput;  // per view
+bool g_resetAll = true;
+float g_lastJitter[2] = {0, 0}, g_lastScale[2] = {0, 0};
 
 void OnDilateVelocity(command_list* cl, ListState& s) {
     const resource depth = Bound(cl, s.compute, 0, 0);
-    if (!depth.handle) return;
-    if (depth != g_frame.depth) Log("scene depth: %p", reinterpret_cast<void*>(depth.handle));
-    g_frame.depth = depth;
-    g_frame.haveDepth = true;
+    const resource velocity = Bound(cl, s.compute, 1, 0);
+    if (!depth.handle || !velocity.handle) return;
+    g_depthByVelocity[velocity.handle] = depth;
+    if (g_depthByVelocity.size() > 64) g_depthByVelocity.clear();
+}
+
+void OnRejectShading(command_list* cl, ListState& s) {
+    s.chain = Chain();
+    const resource velocity = Bound(cl, s.compute, 0, 8);
+    auto it = g_depthByVelocity.find(velocity.handle);
+    if (it == g_depthByVelocity.end()) return;
+    s.chain.depth = it->second;
+    s.chain.motion = CopyInput(cl, velocity, resource_usage::shader_resource_non_pixel, format::r16g16_float, "motion");
+    if (g_set.colorSource == 1)
+        s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
+                                  format::r16g16b16a16_float, "scene color");
+}
+
+void OnUpdateHistory(command_list* cl, ListState& s) {
+    if (g_set.colorSource == 0 && s.chain.motion.handle)
+        s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
+                                  format::r16g16b16a16_float, "color");
 }
 
 // ---------------------------------------------------------------- DLSS
 
 bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z) {
     device* dev = cl->get_device();
+    const Chain chain = s.chain;
+    s.chain = Chain();  // used once
     const resource output = Bound(cl, s.compute, 1, 0);
-    const bool inputs = output.handle && g_frame.haveDepth && g_frame.haveMotion && g_frame.haveColor;
-    g_frame.haveMotion = g_frame.haveColor = false;  // copied again next frame
-    if (!inputs) {
-        g_error = "TSR inputs not found this frame";
-        return false;
-    }
-    float common[2] = {0, 0};
-    if (!ReadConstants(cl, s.compute, 2, 0, common, 2) || !ReadConstants(cl, s.compute, 2, 256, g_frame.jitter, 2) ||
-        !ReadConstants(cl, s.compute, 2, 272, g_frame.motionScale, 2)) {
-        g_error = "TSR parameters not readable";
-        return false;
-    }
-    g_frame.renderSize[0] = common[0], g_frame.renderSize[1] = common[1];
-    std::string err;
-    if (!dlss::Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), err)) {
-        g_error = err;
+    if (!output.handle || !chain.depth.handle || !chain.motion.handle || !chain.color.handle) {
+        ++g_skipped;
         return false;
     }
     const resource_desc out = dev->get_resource_desc(output);
-    const unsigned rw = static_cast<unsigned>(g_frame.renderSize[0]), rh = static_cast<unsigned>(g_frame.renderSize[1]);
-    if (!rw || !rh || rw > g_color.desc.texture.width || rh > g_color.desc.texture.height) {
-        g_error = "render size not found";
+    if (out.texture.format != format::r11g11b10_float) {
+        ++g_skipped;
         return false;
     }
-    if (rw != g_lastRenderW || rh != g_lastRenderH) g_reset = true, g_lastRenderW = rw, g_lastRenderH = rh;
+    float common[2] = {0, 0}, jitter[2] = {0, 0}, scale[2] = {0, 0};
+    if (!ReadConstants(cl, s.compute, 2, 0, common, 2) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2) ||
+        !ReadConstants(cl, s.compute, 2, 272, scale, 2)) {
+        g_error = "TSR parameters not readable";
+        ++g_skipped;
+        return false;
+    }
+    const resource_desc cd = dev->get_resource_desc(chain.color);
+    const unsigned rw = static_cast<unsigned>(common[0]), rh = static_cast<unsigned>(common[1]);
+    if (!rw || !rh || rw > cd.texture.width || rh > cd.texture.height || std::fabs(jitter[0]) > 0.5f ||
+        std::fabs(jitter[1]) > 0.5f) {
+        g_error = "TSR parameters out of range";
+        ++g_skipped;
+        return false;
+    }
+    std::string err;
+    if (!dlss::Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), err)) {
+        g_error = err;
+        ++g_skipped;
+        return false;
+    }
+    g_lastJitter[0] = jitter[0], g_lastJitter[1] = jitter[1], g_lastScale[0] = scale[0], g_lastScale[1] = scale[1];
+    if (g_resetAll) g_resetByOutput.clear(), g_resetAll = false;
+    auto rs = g_resetByOutput.find(output.handle);
+    const bool reset = rs == g_resetByOutput.end() || rs->second;
 
     cl->dispatch(x, y, z);  // the game's ResolveHistory, with its own bindings
     cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
 
     dlss::Inputs in;
-    in.color = reinterpret_cast<ID3D12Resource*>(g_color.tex.handle);
-    in.motion = reinterpret_cast<ID3D12Resource*>(g_motion.tex.handle);
-    in.depth = reinterpret_cast<ID3D12Resource*>(g_frame.depth.handle);
+    in.color = reinterpret_cast<ID3D12Resource*>(chain.color.handle);
+    in.motion = reinterpret_cast<ID3D12Resource*>(chain.motion.handle);
+    in.depth = reinterpret_cast<ID3D12Resource*>(chain.depth.handle);
     in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
     in.renderWidth = rw, in.renderHeight = rh;
     in.outputWidth = out.texture.width, in.outputHeight = out.texture.height;
-    in.jitterX = g_frame.jitter[0] * (g_set.flipJitterX ? -1.0f : 1.0f);
-    in.jitterY = g_frame.jitter[1] * (g_set.flipJitterY ? -1.0f : 1.0f);
+    in.jitterX = jitter[0] * (g_set.flipJitterX ? -1.0f : 1.0f);
+    in.jitterY = jitter[1] * (g_set.flipJitterY ? -1.0f : 1.0f);
     // TSR's velocity is current minus previous; DLSS wants previous minus current, in pixels.
-    const float base[2] = {g_set.motionMode == 0 ? g_frame.motionScale[0] : 1.0f,
-                           g_set.motionMode == 0 ? g_frame.motionScale[1] : 1.0f};
+    const float base[2] = {g_set.motionMode == 0 ? scale[0] : 1.0f, g_set.motionMode == 0 ? scale[1] : 1.0f};
     const float on = g_set.motionMode == 2 ? 0.0f : 1.0f;
     in.motionScaleX = -base[0] * on * (g_set.flipMotionX ? -1.0f : 1.0f);
     in.motionScaleY = -base[1] * on * (g_set.flipMotionY ? -1.0f : 1.0f);
-    in.reset = g_reset;
+    in.reset = reset;
     in.preset = g_set.preset;
     const bool ok = dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err);
     cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
     Restore(cl, s);
     if (ok) {
-        g_reset = false;
+        g_resetByOutput[output.handle] = false;
         g_error.clear();
         if (++g_evaluated == 1) Log("DLSS: first frame evaluated");
-    } else if (g_error != err) {
-        g_error = err;
-        Log("DLSS: %s", err.c_str());
+    } else {
+        ++g_skipped;
+        if (g_error != err) {
+            g_error = err;
+            Log("DLSS: %s", err.c_str());
+        }
     }
     return true;  // the game's dispatch was recorded above
 }
@@ -367,14 +421,11 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
         case kTsrDilateVelocity:
             OnDilateVelocity(cl, *s);
             return false;
-        case kTsrRejectShading:  // t8: dilated motion vectors; t0: scene color (diagnostics)
-            g_frame.haveMotion = g_motion.From(cl, Bound(cl, s->compute, 0, 8), resource_usage::shader_resource_non_pixel);
-            if (g_set.colorSource == 1)
-                g_frame.haveColor = g_color.From(cl, Bound(cl, s->compute, 0, 0), resource_usage::shader_resource_non_pixel);
+        case kTsrRejectShading:
+            OnRejectShading(cl, *s);
             return false;
-        case kTsrUpdateHistory:  // t0: TSR's feed: scene color, translucency included
-            if (g_set.colorSource == 0)
-                g_frame.haveColor = g_color.From(cl, Bound(cl, s->compute, 0, 0), resource_usage::shader_resource_non_pixel);
+        case kTsrUpdateHistory:
+            OnUpdateHistory(cl, *s);
             return false;
         case kTsrResolveHistory:
             return Evaluate(cl, *s, x, y, z);
@@ -386,8 +437,7 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
 void OnDestroyDevice(device* dev) {
     std::lock_guard<std::mutex> lock(g_mutex);
     dlss::Shutdown();
-    g_motion.Destroy(dev);
-    g_color.Destroy(dev);
+    g_pool.Destroy(dev);
 }
 
 bool g_keyWasDown = false;
@@ -397,9 +447,10 @@ void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, c
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
     const bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(kToggleHotkey) & 0x8000);
+    dlss::EndFrame();
     if (down && !g_keyWasDown) {
         g_set.enabled = !g_set.enabled;
-        g_reset = true;
+        g_resetAll = true;
         SaveSettings();
         Log("DLSS %s (F9)", g_set.enabled ? "on" : "off");
     }
@@ -444,9 +495,10 @@ void DrawUpscalerOverlay() {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_set.enabled && !g_error.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_error.c_str());
-        ImGui::TextDisabled("Frames upscaled: %llu. Jitter %.3f, %.3f px; velocity scale %.0f, %.0f",
-                            static_cast<unsigned long long>(g_evaluated.load()), g_frame.jitter[0], g_frame.jitter[1],
-                            g_frame.motionScale[0], g_frame.motionScale[1]);
+        ImGui::TextDisabled("Views upscaled: %llu, left to TSR: %llu. Jitter %.3f, %.3f px; velocity scale %.0f, %.0f",
+                            static_cast<unsigned long long>(g_evaluated.load()),
+                            static_cast<unsigned long long>(g_skipped.load()), g_lastJitter[0], g_lastJitter[1],
+                            g_lastScale[0], g_lastScale[1]);
     }
     const char* presets[] = {"Default", "J", "K (transformer, recommended)", "L", "M"};
     const int ids[] = {0, 10, 11, 12, 13};
@@ -463,7 +515,7 @@ void DrawUpscalerOverlay() {
     changed |= ImGui::Checkbox("Flip jitter X", &g_set.flipJitterX);
     ImGui::SameLine();
     changed |= ImGui::Checkbox("Flip jitter Y", &g_set.flipJitterY);
-    if (ImGui::Button("Reset DLSS history")) g_reset = true;
+    if (ImGui::Button("Reset DLSS history")) g_resetAll = true;
     ImGui::SeparatorText("Diagnostics");
     ImGui::TextDisabled("To find the cause of shimmering. Keep the camera still when comparing.");
     const char* motionModes[] = {"TSR scale (default)", "Already in pixels", "Off (zero)"};
@@ -473,7 +525,7 @@ void DrawUpscalerOverlay() {
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
     changed |= ImGui::Combo("Color input", &g_set.colorSource, colorSources, 2);
     if (changed) {
-        g_reset = true;
+        g_resetAll = true;
         SaveSettings();
         Log("settings: DLSS %s, preset %d, flip motion %d%d, flip jitter %d%d, motion mode %d, color source %d",
             g_set.enabled ? "on" : "off", g_set.preset, g_set.flipMotionX, g_set.flipMotionY, g_set.flipJitterX,

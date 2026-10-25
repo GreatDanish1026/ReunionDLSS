@@ -23,10 +23,14 @@ struct Inputs {
 // Loads NGX for the device (once). False with a reason if DLSS can't run.
 bool Init(ID3D12Device* device, std::string& error);
 
-// Records DLSS on the command list (creating the feature when the sizes or preset change). The
+// Records DLSS on the command list. Each output has its own feature (history), created when
+// first seen and recreated when the sizes or preset change. The
 // inputs must be in a shader resource state and the output in the unordered access state.
 // Changes the command list's compute state and descriptor heaps.
 bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& error);
+
+// Once per presented frame: releases replaced features the GPU is done with.
+void EndFrame();
 
 void Shutdown();
 
