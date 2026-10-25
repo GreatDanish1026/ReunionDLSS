@@ -22,8 +22,9 @@ $addon = "$root\bin\ReunionDLSS.addon64"
 # ReShade add-on headers in third_party\reshade match ReShade 6.8.0.
 $cmd = @(
     "call `"$vcvars`" >nul",
+    "fxc /nologo /T cs_5_1 /E main /O3 /Vn kMotionCs /Fh `"$obj\motion_cs.h`" `"$root\src\motion.hlsl`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
-     "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" " +
+     "/I `"$obj`" /I `"$root\third_party\imgui`" /I`"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" " +
      "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" `"$root\src\upscaler.cpp`" `"$root\src\dlss.cpp`" user32.lib advapi32.lib ole32.lib d3d12.lib dxgi.lib `"$root\third_party\dlss\lib\nvsdk_ngx_s.lib`" " +
      "/link /DLL /OUT:`"$addon`" /PDB:`"$obj\ReunionDLSS.pdb`" /DEBUG")
 ) -join " && "

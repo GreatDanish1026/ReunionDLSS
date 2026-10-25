@@ -2,9 +2,11 @@
 //
 // TSR's intermediates are transient (their memory is reused within the frame), so the inputs are
 // taken while they exist:
-//   DilateVelocity (t0): the scene depth (DilateVelocity is recorded in a different command list,
-//     possibly in parallel, so only the depth resource is taken from it: it lives across frames)
-//   RejectShading (t8): TSR's dilated motion vectors -> copied into our own texture
+//   DilateVelocity (t0 depth, t1 engine velocity): our own motion vectors (motion.hlsl) are
+//     computed there into our own texture. The engine's velocity only covers moving objects; the
+//     camera's motion comes from the depth and View.ClipToPrevClip (found in the View uniform
+//     buffer from TemporalAAJitter). DilateVelocity is recorded in a different command list, so
+//     the result is found later through its output u0, which RejectShading reads (t8).
 //   UpdateHistory (t0): the scene color with translucency -> copied into our own texture
 //   ResolveHistory (u0): the 3840x2160 output, and from its parameters the render size, jitter and
 //     motion vector scale (offsets 0, 256 and 272, docs/FINDINGS.md). The game's pass runs first
@@ -33,6 +35,7 @@
 
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
 #include "dlss.hpp"
+#include "motion_cs.h"  // kMotionCs: motion.hlsl compiled by build.ps1
 #include "version.h"
 
 using namespace reshade::api;
@@ -49,7 +52,8 @@ struct Settings {
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
     bool flipMotionX = false, flipMotionY = false;
     bool flipJitterX = false, flipJitterY = false;
-    int motionMode = 0;   // diagnostics: 0 TSR's scale, 1 already in pixels (scale 1), 2 off (zero)
+    int motionSource = 0;  // 0 computed (camera + objects), 1 TSR's dilated texture (shimmers), 2 off (zero)
+    bool transposeMatrix = false;  // diagnostics: View.ClipToPrevClip read as columns
     int colorSource = 0;  // diagnostics: 0 TSR's feed (UpdateHistory t0), 1 scene color (RejectShading t0)
 } g_set;
 
@@ -61,7 +65,8 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipMotionY", g_set.flipMotionY);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "MotionMode", g_set.motionMode);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "MotionSource", g_set.motionSource);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "TransposeMatrix", g_set.transposeMatrix);
     reshade::get_config_value(nullptr, RD_PRODUCT, "ColorSource", g_set.colorSource);
 }
 
@@ -72,7 +77,8 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "FlipMotionY", g_set.flipMotionY);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "MotionMode", g_set.motionMode);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "MotionSource", g_set.motionSource);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "TransposeMatrix", g_set.transposeMatrix);
     reshade::set_config_value(nullptr, RD_PRODUCT, "ColorSource", g_set.colorSource);
 }
 
@@ -228,6 +234,8 @@ bool ReadConstants(command_list* cl, const StageState& st, uint32_t param, uint3
     if (it == st.roots.end() || it->second.type != descriptor_type::constant_buffer) return false;
     device* dev = cl->get_device();
     const buffer_range& b = it->second.range;
+    const resource_desc bd = dev->get_resource_desc(b.buffer);
+    if (bd.type != resource_type::buffer || b.offset + offset + count * 4ull > bd.buffer.size) return false;
     void* data = nullptr;
     if (!dev->map_buffer_region(b.buffer, b.offset + offset, count * 4, map_access::read_only, &data) || !data) return false;
     memcpy(out, data, count * 4);
@@ -270,7 +278,7 @@ struct CopyPool {
     }
 };
 
-std::mutex g_mutex;
+std::recursive_mutex g_mutex;  // destroying resources can call back into OnDestroyResource
 CopyPool g_pool;
 
 // Copies <src> (in state <srcState>, format <want>) into a pool texture; {0} if the format isn't
@@ -298,15 +306,40 @@ resource CopyInput(command_list* cl, resource src, resource_usage srcState, form
     return tex;
 }
 
-// DilateVelocity writes the dilated velocity (u0) that RejectShading reads (t8), and is recorded
-// in another command list, so its depth is found through that texture.
-std::map<uint64_t, resource> g_depthByVelocity;
+// DilateVelocity writes a texture (u0) that RejectShading reads (t8), and is recorded in another
+// command list, so its depth and our motion vectors are found through that texture.
+struct Link {
+    resource depth = {0}, motion = {0};
+};
+std::map<uint64_t, Link> g_links;
 
 std::atomic<uint64_t> g_evaluated{0}, g_skipped{0};
 std::string g_error;
 std::map<uint64_t, bool> g_resetByOutput;  // per view
 bool g_resetAll = true;
 float g_lastJitter[2] = {0, 0}, g_lastScale[2] = {0, 0};
+
+constexpr uint32_t kViewScanFloats = 4096;  // the first 16 KB of the View uniform buffer
+
+struct MotionState {
+    pipeline_layout layout = {0};
+    pipeline pipe = {0};
+    bool failed = false;
+    int offset = -1;  // byte offset of View.ClipToPrevClip, -1 until found
+    int candidate = -1, hits = 0;
+    float matrix[16] = {};  // the last one used (log)
+    std::map<std::pair<uint64_t, int>, resource_view> views;  // by resource and kind (0 SRV, 1 UAV)
+    struct Texture {
+        uint32_t width = 0, height = 0;
+        resource tex = {0};
+    };
+    std::vector<Texture> textures;  // rg16f, one per size, kept until shutdown
+} g_motion;
+
+void LogMatrix(const char* label, const float* m) {
+    Log("%s: [%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f]", label, m[0], m[1],
+        m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+}
 
 // ---------------------------------------------------------------- texture sampling
 //
@@ -327,9 +360,7 @@ struct Sample {
     bool pending = false;
     uint32_t width = 0, height = 0, layers = 1, bytes = 4;
 };
-Sample g_samples[3] = {{"TSR closest depth (DilateVelocity u0, rg16f)", Decode::Half2},
-                       {"TSR reprojection (DilateVelocity u2, r32uint array)", Decode::Uint},
-                       {"engine velocity (DilateVelocity t1, rgba16unorm)", Decode::Unorm4}};
+Sample g_samples[1] = {{"computed motion (render pixels, previous minus current)", Decode::Half2}};
 uint64_t g_presentFrame = 0;
 
 float Half(uint16_t h) {
@@ -391,26 +422,193 @@ void ReadSamples(device* dev) {
             Log("%s", line);
         }
         dev->unmap_buffer_region(sm.buffer);
+        LogMatrix("  ClipToPrevClip used", g_motion.matrix);
+    }
+}
+
+// ---------------------------------------------------------------- motion vectors
+
+bool Near(float a, float b) { return std::fabs(a - b) <= b * 2e-3f + 1e-9f; }
+
+// UE's View uniform buffer has ClipToPrevClip, ClipToPrevClipWithAA, TemporalAAJitter in that
+// order, and TemporalAAJitter.xy is TSR's jitter in clip units (2 / size, either sign). The
+// jitter changes every frame, so a match at the same place several frames in a row is it.
+void FindClipToPrevClip(const float* v, const float jitter[2], const float size[2]) {
+    const float jx = std::fabs(jitter[0] * 2 / size[0]), jy = std::fabs(jitter[1] * 2 / size[1]);
+    if (jx < 1e-5f || jy < 1e-5f) return;  // too close to zero to tell apart
+    int found = -1, matches = 0;
+    for (uint32_t i = 32; i + 2 <= kViewScanFloats; i += 4)
+        if (Near(std::fabs(v[i]), jx) && Near(std::fabs(v[i + 1]), jy)) {
+            if (found < 0) found = static_cast<int>(i - 32) * 4;
+            ++matches;
+        }
+    if (found < 0) {
+        g_motion.candidate = -1, g_motion.hits = 0;
+        return;
+    }
+    if (found == g_motion.candidate) ++g_motion.hits;
+    else g_motion.candidate = found, g_motion.hits = 1;
+    if (g_motion.hits < 4) return;
+    g_motion.offset = found;
+    Log("View.ClipToPrevClip at byte %d of the View uniform buffer (jitter matched %d place(s); TemporalAAJitter %.6f %.6f)",
+        found, matches, v[found / 4 + 32], v[found / 4 + 33]);
+    LogMatrix("ClipToPrevClip", v + found / 4);
+    LogMatrix("ClipToPrevClipWithAA", v + found / 4 + 16);
+}
+
+bool CreateMotionPipeline(device* dev) {
+    if (g_motion.pipe.handle) return true;
+    if (g_motion.failed) return false;
+    constant_range c = {};
+    c.count = 20;
+    c.visibility = shader_stage::all_compute;
+    descriptor_range srv = {};
+    srv.count = 2;
+    srv.visibility = shader_stage::all_compute;
+    srv.type = descriptor_type::shader_resource_view;
+    descriptor_range uav = {};
+    uav.count = 1;
+    uav.visibility = shader_stage::all_compute;
+    uav.type = descriptor_type::unordered_access_view;
+    const pipeline_layout_param params[3] = {pipeline_layout_param(c), pipeline_layout_param(srv), pipeline_layout_param(uav)};
+    shader_desc cs = {};
+    cs.code = kMotionCs;
+    cs.code_size = sizeof(kMotionCs);
+    pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+    if (!dev->create_pipeline_layout(3, params, &g_motion.layout) ||
+        !dev->create_pipeline(g_motion.layout, 1, &sub, &g_motion.pipe)) {
+        g_motion.failed = true;
+        g_error = "couldn't create the motion vector shader";
+        Log("%s", g_error.c_str());
+        return false;
+    }
+    Log("motion vector shader created");
+    return true;
+}
+
+resource MotionTexture(device* dev, uint32_t w, uint32_t h) {
+    for (const MotionState::Texture& t : g_motion.textures)
+        if (t.width == w && t.height == h) return t.tex;
+    if (g_motion.textures.size() >= 8) return {0};
+    MotionState::Texture t;
+    t.width = w, t.height = h;
+    const resource_desc d(w, h, 1, 1, format::r16g16_float, 1, memory_heap::default_,
+                          resource_usage::shader_resource | resource_usage::unordered_access);
+    if (!dev->create_resource(d, nullptr, resource_usage::shader_resource_non_pixel, &t.tex)) {
+        Log("couldn't create a %ux%u motion vector texture", w, h);
+        return {0};
+    }
+    Log("created %ux%u motion vector texture", w, h);
+    g_motion.textures.push_back(t);
+    return t.tex;
+}
+
+resource_view View(device* dev, resource r, format f, bool uav) {
+    const auto key = std::make_pair(r.handle, uav ? 1 : 0);
+    auto it = g_motion.views.find(key);
+    if (it != g_motion.views.end()) return it->second;
+    resource_view v = {0};
+    if (!dev->create_resource_view(r, uav ? resource_usage::unordered_access : resource_usage::shader_resource,
+                                   resource_view_desc(f), &v))
+        return {0};
+    g_motion.views[key] = v;
+    return v;
+}
+
+void LogOnce(int& count, const char* fmt, uint32_t a, uint32_t b) {
+    if (count >= 10) return;
+    ++count;
+    Log(fmt, a, b);
+}
+
+// Records motion.hlsl before the game's DilateVelocity (same inputs) and puts its state back.
+resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource velocity) {
+    static int badFormat = 0, badParams = 0;
+    device* dev = cl->get_device();
+    if (!velocity.handle) return {0};
+    const resource_desc dd = dev->get_resource_desc(depth), vd = dev->get_resource_desc(velocity);
+    if (dd.texture.format != format::r32_g8_typeless || vd.texture.format != format::r16g16b16a16_unorm) {
+        LogOnce(badFormat, "motion: depth format %u, velocity format %u: TSR kept for this view",
+                static_cast<uint32_t>(dd.texture.format), static_cast<uint32_t>(vd.texture.format));
+        return {0};
+    }
+    float size[2] = {0, 0}, jitter[2] = {0, 0};
+    if (!ReadConstants(cl, s.compute, 2, 0, size, 2) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2) ||
+        size[0] < 16 || size[1] < 16 || size[0] > dd.texture.width || size[1] > dd.texture.height ||
+        std::fabs(jitter[0]) > 0.5f || std::fabs(jitter[1]) > 0.5f) {
+        LogOnce(badParams, "motion: DilateVelocity parameters not usable (size %u x %u)", static_cast<uint32_t>(size[0]),
+                static_cast<uint32_t>(size[1]));
+        return {0};
+    }
+    static std::vector<float> view(kViewScanFloats);
+    if (!ReadConstants(cl, s.compute, 3, 0, view.data(), kViewScanFloats)) return {0};
+    if (g_motion.offset < 0) {
+        FindClipToPrevClip(view.data(), jitter, size);
+        if (g_motion.offset < 0) return {0};
+    }
+    if (!CreateMotionPipeline(dev)) return {0};
+    const resource tex = MotionTexture(dev, dd.texture.width, dd.texture.height);
+    if (!tex.handle) return {0};
+    const resource_view srvs[2] = {View(dev, depth, format::r32_float_x8_uint, false),
+                                   View(dev, velocity, format::r16g16b16a16_unorm, false)};
+    const resource_view uav = View(dev, tex, format::r16g16_float, true);
+    if (!srvs[0].handle || !srvs[1].handle || !uav.handle) return {0};
+
+    float params[20];
+    const float* m = view.data() + g_motion.offset / 4;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) params[r * 4 + c] = g_set.transposeMatrix ? m[c * 4 + r] : m[r * 4 + c];
+    memcpy(g_motion.matrix, params, sizeof(g_motion.matrix));
+    params[16] = size[0], params[17] = size[1], params[18] = 1 / size[0], params[19] = 1 / size[1];
+
+    cl->barrier(tex, resource_usage::shader_resource_non_pixel, resource_usage::unordered_access);
+    cl->bind_pipeline(pipeline_stage::all_compute, g_motion.pipe);
+    cl->push_constants(shader_stage::all_compute, g_motion.layout, 0, 0, 20, params);
+    descriptor_table_update u = {};
+    u.count = 2;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = srvs;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.layout, 1, u);
+    u.count = 1;
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = &uav;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.layout, 2, u);
+    cl->dispatch((static_cast<uint32_t>(size[0]) + 7) / 8, (static_cast<uint32_t>(size[1]) + 7) / 8, 1);
+    cl->barrier(tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
+    Restore(cl, s);
+    SampleTexture(cl, g_samples[0], tex, resource_usage::shader_resource_non_pixel);
+    return tex;
+}
+
+void OnDestroyResource(device* dev, resource r) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    for (int kind = 0; kind < 2; ++kind) {
+        auto it = g_motion.views.find(std::make_pair(r.handle, kind));
+        if (it == g_motion.views.end()) continue;
+        dev->destroy_resource_view(it->second);
+        g_motion.views.erase(it);
     }
 }
 
 void OnDilateVelocity(command_list* cl, ListState& s) {
-    SampleTexture(cl, g_samples[2], Bound(cl, s.compute, 0, 1), resource_usage::shader_resource_non_pixel);
     const resource depth = Bound(cl, s.compute, 0, 0);
-    const resource velocity = Bound(cl, s.compute, 1, 0);
-    if (!depth.handle || !velocity.handle) return;
-    g_depthByVelocity[velocity.handle] = depth;
-    if (g_depthByVelocity.size() > 64) g_depthByVelocity.clear();
+    const resource velocity = Bound(cl, s.compute, 0, 1);
+    const resource out = Bound(cl, s.compute, 1, 0);
+    if (!depth.handle || !out.handle) return;
+    if (g_links.size() > 64) g_links.clear();
+    Link& link = g_links[out.handle];
+    link.depth = depth;
+    link.motion = g_set.motionSource == 0 ? ComputeMotion(cl, s, depth, velocity) : resource{0};
 }
 
 void OnRejectShading(command_list* cl, ListState& s) {
     s.chain = Chain();
-    const resource velocity = Bound(cl, s.compute, 0, 8);
-    auto it = g_depthByVelocity.find(velocity.handle);
-    if (it == g_depthByVelocity.end()) return;
-    s.chain.depth = it->second;
-    s.chain.motion = CopyInput(cl, velocity, resource_usage::shader_resource_non_pixel, format::r16g16_float, "motion");
-    if (s.chain.motion.handle) SampleTexture(cl, g_samples[0], s.chain.motion, resource_usage::shader_resource_non_pixel);
+    const resource dilated = Bound(cl, s.compute, 0, 8);
+    auto it = g_links.find(dilated.handle);
+    if (it == g_links.end()) return;
+    s.chain.depth = it->second.depth;
+    if (g_set.motionSource == 0) s.chain.motion = it->second.motion;  // none: TSR kept for this view
+    else s.chain.motion = CopyInput(cl, dilated, resource_usage::shader_resource_non_pixel, format::r16g16_float, "motion");
     if (g_set.colorSource == 1)
         s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
                                   format::r16g16b16a16_float, "scene color");
@@ -476,11 +674,12 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.outputWidth = out.texture.width, in.outputHeight = out.texture.height;
     in.jitterX = jitter[0] * (g_set.flipJitterX ? -1.0f : 1.0f);
     in.jitterY = jitter[1] * (g_set.flipJitterY ? -1.0f : 1.0f);
-    // TSR's velocity is current minus previous; DLSS wants previous minus current, in pixels.
-    const float base[2] = {g_set.motionMode == 0 ? scale[0] : 1.0f, g_set.motionMode == 0 ? scale[1] : 1.0f};
-    const float on = g_set.motionMode == 2 ? 0.0f : 1.0f;
-    in.motionScaleX = -base[0] * on * (g_set.flipMotionX ? -1.0f : 1.0f);
-    in.motionScaleY = -base[1] * on * (g_set.flipMotionY ? -1.0f : 1.0f);
+    // Ours are already previous minus current in pixels (what DLSS wants). TSR's texture would be
+    // current minus previous in screen units.
+    const float base[2] = {g_set.motionSource == 0 ? 1.0f : -scale[0], g_set.motionSource == 0 ? 1.0f : -scale[1]};
+    const float on = g_set.motionSource == 2 ? 0.0f : 1.0f;
+    in.motionScaleX = base[0] * on * (g_set.flipMotionX ? -1.0f : 1.0f);
+    in.motionScaleY = base[1] * on * (g_set.flipMotionY ? -1.0f : 1.0f);
     in.reset = reset;
     in.preset = g_set.preset;
     const bool ok = dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err);
@@ -504,13 +703,10 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
     if (!g_set.enabled) return false;
     ListState* s = State(cl);
     if (!s) return false;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     switch (s->computeId) {
         case kTsrDilateVelocity:
             OnDilateVelocity(cl, *s);
-            return false;
-        case kTsrDecimateHistory:  // t0: DilateVelocity's u2, written just before
-            SampleTexture(cl, g_samples[1], Bound(cl, s->compute, 0, 0), resource_usage::shader_resource_non_pixel);
             return false;
         case kTsrRejectShading:
             OnRejectShading(cl, *s);
@@ -526,18 +722,25 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
 }
 
 void OnDestroyDevice(device* dev) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     dlss::Shutdown();
     g_pool.Destroy(dev);
     for (Sample& sm : g_samples)
         if (sm.buffer.handle) dev->destroy_resource(sm.buffer), sm.buffer = {0};
+    for (auto& [key, v] : g_motion.views) dev->destroy_resource_view(v);
+    g_motion.views.clear();
+    for (MotionState::Texture& t : g_motion.textures) dev->destroy_resource(t.tex);
+    if (g_motion.pipe.handle) dev->destroy_pipeline(g_motion.pipe);
+    if (g_motion.layout.handle) dev->destroy_pipeline_layout(g_motion.layout);
+    g_motion = MotionState();
+    g_links.clear();
 }
 
 bool g_keyWasDown = false;
 
 void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         ++g_presentFrame;
         ReadSamples(sc->get_device());
     }
@@ -568,6 +771,7 @@ void RegisterUpscaler() {
     reshade::register_event<reshade::addon_event::push_constants>(&OnPushConstants);
     reshade::register_event<reshade::addon_event::dispatch>(&OnDispatch);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
+    reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
     reshade::register_event<reshade::addon_event::present>(&OnPresent);
 }
 
@@ -581,6 +785,7 @@ void UnregisterUpscaler() {
     reshade::unregister_event<reshade::addon_event::push_constants>(&OnPushConstants);
     reshade::unregister_event<reshade::addon_event::dispatch>(&OnDispatch);
     reshade::unregister_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
+    reshade::unregister_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
     reshade::unregister_event<reshade::addon_event::present>(&OnPresent);
 }
 
@@ -591,7 +796,7 @@ void DrawUpscalerOverlay() {
     ImGui::SameLine();
     ImGui::TextDisabled("%s", g_set.enabled ? dlss::Status().c_str() : "off: the game's TSR");
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (g_set.enabled && !g_error.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_error.c_str());
         ImGui::TextDisabled("Views upscaled: %llu, left to TSR: %llu. Jitter %.3f, %.3f px; velocity scale %.0f, %.0f",
                             static_cast<unsigned long long>(g_evaluated.load()),
@@ -616,18 +821,25 @@ void DrawUpscalerOverlay() {
     if (ImGui::Button("Reset DLSS history")) g_resetAll = true;
     ImGui::SeparatorText("Diagnostics");
     ImGui::TextDisabled("To find the cause of shimmering. Keep the camera still when comparing.");
-    const char* motionModes[] = {"TSR scale (default)", "Already in pixels", "Off (zero)"};
+    const char* motionSources[] = {"Computed (default)", "TSR's texture (shimmers)", "Off (zero)"};
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
-    changed |= ImGui::Combo("Motion vectors", &g_set.motionMode, motionModes, 3);
+    changed |= ImGui::Combo("Motion vectors", &g_set.motionSource, motionSources, 3);
+    ImGui::SameLine();
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (g_motion.offset >= 0) ImGui::TextDisabled("camera matrix at View +%d", g_motion.offset);
+        else ImGui::TextDisabled("looking for the camera matrix");
+    }
+    changed |= ImGui::Checkbox("Transpose camera matrix", &g_set.transposeMatrix);
     const char* colorSources[] = {"TSR feed (default)", "Scene color"};
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
     changed |= ImGui::Combo("Color input", &g_set.colorSource, colorSources, 2);
     if (changed) {
         g_resetAll = true;
         SaveSettings();
-        Log("settings: DLSS %s, preset %d, flip motion %d%d, flip jitter %d%d, motion mode %d, color source %d",
+        Log("settings: DLSS %s, preset %d, flip motion %d%d, flip jitter %d%d, motion source %d, transpose %d, color source %d",
             g_set.enabled ? "on" : "off", g_set.preset, g_set.flipMotionX, g_set.flipMotionY, g_set.flipJitterX,
-            g_set.flipJitterY, g_set.motionMode, g_set.colorSource);
+            g_set.flipJitterY, g_set.motionSource, g_set.transposeMatrix, g_set.colorSource);
     }
 }
 
