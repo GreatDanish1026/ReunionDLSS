@@ -66,7 +66,6 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
     reshade::get_config_value(nullptr, RD_PRODUCT, "MotionSource", g_set.motionSource);
-    reshade::get_config_value(nullptr, RD_PRODUCT, "TransposeMatrix", g_set.transposeMatrix);
     reshade::get_config_value(nullptr, RD_PRODUCT, "ColorSource", g_set.colorSource);
 }
 
@@ -430,18 +429,50 @@ void ReadSamples(device* dev) {
 
 bool Near(float a, float b) { return std::fabs(a - b) <= b * 2e-3f + 1e-9f; }
 
+// Writes the View uniform buffer's first floats to ReunionDLSS-view.txt (once), to check offline
+// which matrix is where.
+void DumpView(const float* v, const float jitter[2], const float size[2]) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    FILE* f = _wfopen((ExeDir() + L"ReunionDLSS-view.txt").c_str(), L"w");
+    if (!f) return;
+    fprintf(f, "View uniform buffer, %u floats. Jitter %.6f %.6f px, render size %.0f x %.0f\n", kViewScanFloats, jitter[0],
+            jitter[1], size[0], size[1]);
+    for (uint32_t i = 0; i < kViewScanFloats; i += 4)
+        fprintf(f, "%5u: %12.6g %12.6g %12.6g %12.6g\n", i * 4, v[i], v[i + 1], v[i + 2], v[i + 3]);
+    fclose(f);
+    Log("View uniform buffer written to ReunionDLSS-view.txt");
+}
+
 // UE's View uniform buffer has ClipToPrevClip, ClipToPrevClipWithAA, TemporalAAJitter in that
-// order, and TemporalAAJitter.xy is TSR's jitter in clip units (2 / size, either sign). The
-// jitter changes every frame, so a match at the same place several frames in a row is it.
+// order. TemporalAAJitter is (this frame's jitter, last frame's) in clip units (2 / size, either
+// sign). The jittered projection matrices hold this frame's jitter too, but followed by 0 and 1.
+// ClipToPrevClip maps a clip position to almost the same one (the camera moves little per frame),
+// so its diagonal is near 1. A match at the same place several frames in a row is it.
+bool LooksLikeClipToPrevClip(const float* m) {
+    for (int i = 0; i < 16; ++i)
+        if (!std::isfinite(m[i])) return false;
+    return std::fabs(m[0] - 1) < 0.2f && std::fabs(m[5] - 1) < 0.2f;
+}
+
 void FindClipToPrevClip(const float* v, const float jitter[2], const float size[2]) {
+    DumpView(v, jitter, size);
     const float jx = std::fabs(jitter[0] * 2 / size[0]), jy = std::fabs(jitter[1] * 2 / size[1]);
     if (jx < 1e-5f || jy < 1e-5f) return;  // too close to zero to tell apart
-    int found = -1, matches = 0;
-    for (uint32_t i = 32; i + 2 <= kViewScanFloats; i += 4)
-        if (Near(std::fabs(v[i]), jx) && Near(std::fabs(v[i + 1]), jy)) {
-            if (found < 0) found = static_cast<int>(i - 32) * 4;
-            ++matches;
-        }
+    static int searches = 0;
+    const bool logMatches = searches++ < 3;  // the first few searches only
+    int found = -1;
+    for (uint32_t i = 32; i + 4 <= kViewScanFloats; i += 4) {
+        if (!Near(std::fabs(v[i]), jx) || !Near(std::fabs(v[i + 1]), jy)) continue;
+        const bool prevJitter = std::fabs(v[i + 2]) < 0.01f && std::fabs(v[i + 3]) < 0.01f &&
+                                (v[i + 2] != 0 || v[i + 3] != 0);
+        const bool ok = prevJitter && LooksLikeClipToPrevClip(v + i - 32);
+        if (logMatches)
+            Log("  jitter at byte %u: %.6f %.6f %.6f %.6f%s", i * 4, v[i], v[i + 1], v[i + 2], v[i + 3],
+                ok ? " (ClipToPrevClip before it)" : "");
+        if (ok && found < 0) found = static_cast<int>(i - 32) * 4;
+    }
     if (found < 0) {
         g_motion.candidate = -1, g_motion.hits = 0;
         return;
@@ -450,8 +481,8 @@ void FindClipToPrevClip(const float* v, const float jitter[2], const float size[
     else g_motion.candidate = found, g_motion.hits = 1;
     if (g_motion.hits < 4) return;
     g_motion.offset = found;
-    Log("View.ClipToPrevClip at byte %d of the View uniform buffer (jitter matched %d place(s); TemporalAAJitter %.6f %.6f)",
-        found, matches, v[found / 4 + 32], v[found / 4 + 33]);
+    Log("View.ClipToPrevClip at byte %d of the View uniform buffer; TemporalAAJitter %.6f %.6f %.6f %.6f", found,
+        v[found / 4 + 32], v[found / 4 + 33], v[found / 4 + 34], v[found / 4 + 35]);
     LogMatrix("ClipToPrevClip", v + found / 4);
     LogMatrix("ClipToPrevClipWithAA", v + found / 4 + 16);
 }
