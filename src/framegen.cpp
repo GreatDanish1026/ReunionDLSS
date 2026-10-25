@@ -53,9 +53,19 @@ constexpr const char* kProjectId = "6f1d6e2a-5b8c-4f2e-9a43-7c2b8e1d4a90";
 constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 64, kViewToTranslatedWorld = 256,
                    kViewToClip = 448, kViewToClipNoAA = 512;
 
+// Frame generation modes, as in The Quarry's add-on: Off, 2x, 3x, 4x (1-3 generated frames per
+// rendered frame) and Dynamic (Streamline picks the multiplier to reach the display's refresh rate).
+enum Mode : int { kOff, k2x, k3x, k4x, kDynamic, kModeCount };
+const char* const kModeNames[kModeCount] = {"Off", "2x", "3x", "4x", "Dynamic"};
+
 struct Settings {
-    bool enabled = false;
+    int mode = kOff;
+    bool enabled = false;  // mode != kOff
 } g_set;
+
+uint32_t g_maxFrames = 1;  // DLSSGState::numFramesToGenerateMax
+bool g_dynamicSupported = false, g_capsKnown = false;
+int g_appliedMode = -1;  // what Streamline was last told (-1: nothing yet)
 
 struct SlApi {
     HMODULE mod = nullptr;
@@ -160,16 +170,40 @@ void Marker(sl::PCLMarker m) {
     if (g_sl.pclSetMarker && g_token) g_sl.pclSetMarker(m, *g_token);
 }
 
+// The mode actually used: 3x/4x need multi-frame generation, Dynamic a recent driver.
+int EffectiveMode(int mode) {
+    if (mode == kDynamic && !g_dynamicSupported) return k2x;
+    if (mode >= k2x && mode <= k4x && static_cast<uint32_t>(mode) > g_maxFrames) return static_cast<int>(g_maxFrames);
+    return mode;
+}
+
 void SetFrameGeneration(bool on) {
-    if (on == g_fgOn || !g_sl.dlssgSetOptions) return;
+    if (!g_sl.dlssgSetOptions) return;
+    if (!g_capsKnown && g_sl.dlssgGetState) {
+        sl::DLSSGState st{};
+        if (g_sl.dlssgGetState(sl::ViewportHandle(0), st, nullptr) == sl::Result::eOk) {
+            g_capsKnown = true;
+            g_maxFrames = st.numFramesToGenerateMax ? st.numFramesToGenerateMax : 1;
+            g_dynamicSupported = st.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+            Log("frame generation: up to %u generated frames per rendered frame, Dynamic %s", g_maxFrames,
+                g_dynamicSupported ? "supported" : "not supported");
+        }
+    }
+    const int mode = on ? EffectiveMode(g_set.mode) : kOff;
+    if (mode == g_appliedMode) return;
     sl::DLSSGOptions o{};
-    o.mode = on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-    o.numFramesToGenerate = 1;
+    o.mode = mode == kOff ? sl::DLSSGMode::eOff : mode == kDynamic ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn;
+    o.numFramesToGenerate = mode >= k2x && mode <= k4x ? static_cast<uint32_t>(mode) : 1;  // ignored by Dynamic
+    o.dynamicTargetFrameRate = 0;  // Dynamic: the display's refresh rate
     o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
     const sl::Result r = g_sl.dlssgSetOptions(sl::ViewportHandle(0), o);
-    if (r != sl::Result::eOk) Log("frame generation: slDLSSGSetOptions(%s) failed: %d", on ? "on" : "off", static_cast<int>(r));
-    else Log("frame generation %s", on ? "running" : "paused");
-    g_fgOn = on;
+    if (r != sl::Result::eOk) {
+        Log("frame generation: slDLSSGSetOptions(%s) failed: %d", kModeNames[mode], static_cast<int>(r));
+    } else if (on != g_fgOn || g_appliedMode != kOff) {
+        Log("frame generation %s", mode == kOff ? "paused" : kModeNames[mode]);
+    }
+    g_appliedMode = mode;
+    g_fgOn = mode != kOff;
 }
 
 void BeforePresent() {
@@ -617,7 +651,13 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
 }
 
 void RegisterFrameGen() {
-    reshade::get_config_value(nullptr, RD_PRODUCT, "FrameGeneration", g_set.enabled);
+    if (!reshade::get_config_value(nullptr, RD_PRODUCT, "FrameGenMode", g_set.mode)) {
+        bool old = false;  // 0.3.x: an on/off switch
+        reshade::get_config_value(nullptr, RD_PRODUCT, "FrameGeneration", old);
+        g_set.mode = old ? k2x : kOff;
+    }
+    if (g_set.mode < kOff || g_set.mode >= kModeCount) g_set.mode = kOff;
+    g_set.enabled = g_set.mode != kOff;
     reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
 }
@@ -630,13 +670,17 @@ void UnregisterFrameGen() {
 
 void DrawFrameGenOverlay() {
     ImGui::SeparatorText("Frame generation (DLSS-G)");
-    bool on = g_set.enabled;
-    if (ImGui::Checkbox("Frame generation", &on)) {
-        g_set.enabled = on;
-        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGeneration", on);
-        Log("settings: frame generation %s", on ? "on" : "off");
+    int mode = g_set.mode;
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10);
+    if (ImGui::Combo("Frame generation", &mode, kModeNames, kModeCount)) {
+        g_set.mode = mode;
+        g_set.enabled = mode != kOff;
+        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", mode);
+        Log("settings: frame generation %s", kModeNames[mode]);
     }
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
+        ImGui::TextDisabled("%s isn't supported here, so %s.", kModeNames[g_set.mode], kModeNames[EffectiveMode(g_set.mode)]);
     if (g_set.enabled && !g_ready) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_initTried || g_factoryHooked ? g_status.c_str()
@@ -653,7 +697,7 @@ void DrawFrameGenOverlay() {
         ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "the game's swapchain wasn't handed to Streamline (see the log)");
         return;
     }
-    ImGui::TextDisabled("%s", g_fgOn ? "generating frames" : g_set.enabled ? "waiting for DLSS (F9)" : "paused");
+    ImGui::TextDisabled("%s", g_fgOn ? "generating frames" : g_set.enabled ? "waiting for DLSS (F9)" : "off");
     ImGui::TextDisabled("Frames presented per rendered frame: %u, status 0x%x", g_state.numFramesActuallyPresented,
                         static_cast<unsigned>(g_state.status));
     ImGui::TextDisabled("Game frames %llu, with inputs %llu", static_cast<unsigned long long>(g_presents.load()),
