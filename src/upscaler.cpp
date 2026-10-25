@@ -49,6 +49,8 @@ struct Settings {
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
     bool flipMotionX = false, flipMotionY = false;
     bool flipJitterX = false, flipJitterY = false;
+    int motionMode = 0;   // diagnostics: 0 TSR's scale, 1 already in pixels (scale 1), 2 off (zero)
+    int colorSource = 0;  // diagnostics: 0 TSR's feed (UpdateHistory t0), 1 scene color (RejectShading t0)
 } g_set;
 
 void LoadSettings() {
@@ -58,6 +60,8 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipMotionY", g_set.flipMotionY);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
     reshade::get_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "MotionMode", g_set.motionMode);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "ColorSource", g_set.colorSource);
 }
 
 void SaveSettings() {
@@ -67,6 +71,8 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "FlipMotionY", g_set.flipMotionY);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FlipJitterX", g_set.flipJitterX);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FlipJitterY", g_set.flipJitterY);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "MotionMode", g_set.motionMode);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "ColorSource", g_set.colorSource);
 }
 
 // ---------------------------------------------------------------- per command list bindings
@@ -331,8 +337,11 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     in.jitterX = g_frame.jitter[0] * (g_set.flipJitterX ? -1.0f : 1.0f);
     in.jitterY = g_frame.jitter[1] * (g_set.flipJitterY ? -1.0f : 1.0f);
     // TSR's velocity is current minus previous; DLSS wants previous minus current, in pixels.
-    in.motionScaleX = -g_frame.motionScale[0] * (g_set.flipMotionX ? -1.0f : 1.0f);
-    in.motionScaleY = -g_frame.motionScale[1] * (g_set.flipMotionY ? -1.0f : 1.0f);
+    const float base[2] = {g_set.motionMode == 0 ? g_frame.motionScale[0] : 1.0f,
+                           g_set.motionMode == 0 ? g_frame.motionScale[1] : 1.0f};
+    const float on = g_set.motionMode == 2 ? 0.0f : 1.0f;
+    in.motionScaleX = -base[0] * on * (g_set.flipMotionX ? -1.0f : 1.0f);
+    in.motionScaleY = -base[1] * on * (g_set.flipMotionY ? -1.0f : 1.0f);
     in.reset = g_reset;
     in.preset = g_set.preset;
     const bool ok = dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err);
@@ -358,11 +367,14 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
         case kTsrDilateVelocity:
             OnDilateVelocity(cl, *s);
             return false;
-        case kTsrRejectShading:  // t8: dilated motion vectors
+        case kTsrRejectShading:  // t8: dilated motion vectors; t0: scene color (diagnostics)
             g_frame.haveMotion = g_motion.From(cl, Bound(cl, s->compute, 0, 8), resource_usage::shader_resource_non_pixel);
+            if (g_set.colorSource == 1)
+                g_frame.haveColor = g_color.From(cl, Bound(cl, s->compute, 0, 0), resource_usage::shader_resource_non_pixel);
             return false;
-        case kTsrUpdateHistory:  // t0: scene color, translucency included
-            g_frame.haveColor = g_color.From(cl, Bound(cl, s->compute, 0, 0), resource_usage::shader_resource_non_pixel);
+        case kTsrUpdateHistory:  // t0: TSR's feed: scene color, translucency included
+            if (g_set.colorSource == 0)
+                g_frame.haveColor = g_color.From(cl, Bound(cl, s->compute, 0, 0), resource_usage::shader_resource_non_pixel);
             return false;
         case kTsrResolveHistory:
             return Evaluate(cl, *s, x, y, z);
@@ -452,11 +464,20 @@ void DrawUpscalerOverlay() {
     ImGui::SameLine();
     changed |= ImGui::Checkbox("Flip jitter Y", &g_set.flipJitterY);
     if (ImGui::Button("Reset DLSS history")) g_reset = true;
+    ImGui::SeparatorText("Diagnostics");
+    ImGui::TextDisabled("To find the cause of shimmering. Keep the camera still when comparing.");
+    const char* motionModes[] = {"TSR scale (default)", "Already in pixels", "Off (zero)"};
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
+    changed |= ImGui::Combo("Motion vectors", &g_set.motionMode, motionModes, 3);
+    const char* colorSources[] = {"TSR feed (default)", "Scene color"};
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
+    changed |= ImGui::Combo("Color input", &g_set.colorSource, colorSources, 2);
     if (changed) {
         g_reset = true;
         SaveSettings();
-        Log("settings: DLSS %s, preset %d, flip motion %d%d, flip jitter %d%d", g_set.enabled ? "on" : "off", g_set.preset,
-            g_set.flipMotionX, g_set.flipMotionY, g_set.flipJitterX, g_set.flipJitterY);
+        Log("settings: DLSS %s, preset %d, flip motion %d%d, flip jitter %d%d, motion mode %d, color source %d",
+            g_set.enabled ? "on" : "off", g_set.preset, g_set.flipMotionX, g_set.flipMotionY, g_set.flipJitterX,
+            g_set.flipJitterY, g_set.motionMode, g_set.colorSource);
     }
 }
 
