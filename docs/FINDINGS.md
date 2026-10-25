@@ -80,3 +80,21 @@ DLSS DLL: signed `nvngx_dlss.dll` 310.9.16, copied from Jedi Survivor's DLSS plu
 (updated there 2026-10-25) next to the game exe. Feature flags: HDR, low-res MVs, inverted
 depth, auto exposure; preset K by default; MV scale = -(TSR's 1248, -702), with flip switches
 in the overlay for calibration. Not tested in game yet.
+
+## Motion vectors (0.1.4 samples, 2026-10-25)
+
+Still, then panning right, center strip of each texture:
+- DilateVelocity u0 (rg16f): closest depth, not motion. Feeding it to DLSS as motion caused the shimmer.
+- DilateVelocity u2 (r32uint x4): reprojection data, no consistent motion during the pan (layer 1 and 3 constant fill).
+- Engine velocity t1 (rgba16unorm): **all zero** during the pan. UE writes velocity only for moving
+  objects (x > 0 means written; decode xy * (1/(0.499*0.5)) - (32767/65535)/(0.499*0.5)).
+
+Plan (0.1.5): own compute shader in DilateVelocity's list (depth t0 + velocity t1 bound there):
+camera motion = screen - (prev.xy/prev.w), prev = (screen, deviceZ, 1) * View.ClipToPrevClip;
+object velocity where t1.x > 0; output rg16f in pixels, previous minus current (x * W/2, y * -H/2),
+DLSS motion scale 1. Find ClipToPrevClip in the View UB (root CBV param 3) by searching for
+TemporalAAJitter = (|jitter.x*2/W|, |jitter.y*2/H|) (jitter from param 2 offset 256); in UE the
+order is ClipToPrevClip, ClipToPrevClipWithAA, TemporalAAJitter, so the matrix is 128 bytes before.
+Lock the offset after a few matching frames; log both matrices to confirm (identity when still).
+Shader compiled with fxc cs_5_1 at build time; ReShade layout: push constants b0 + push descriptors
+t0-t1 and u0; Restore() afterwards; views cached and dropped on destroy_resource.
