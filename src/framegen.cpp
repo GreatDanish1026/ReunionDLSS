@@ -87,6 +87,8 @@ uint32_t g_frame = 0;
 uint32_t g_taggedFrame = UINT32_MAX;  // last frame that got depth, motion and constants
 bool g_fgOn = false;                  // what Streamline was last told
 std::atomic<uint64_t> g_presents{0}, g_tagged{0};
+uint32_t g_untagged = 0;  // game frames in a row without inputs
+sl::DLSSGState g_state{};  // last read on the presenting thread
 
 // The camera, copied from the View uniform buffer when our motion vectors are computed.
 struct Camera {
@@ -174,7 +176,15 @@ void BeforePresent() {
     if (!g_ready) return;
     ++g_presents;
     Marker(sl::PCLMarker::eRenderSubmitEnd);
-    SetFrameGeneration(g_set.enabled && g_taggedFrame == g_frame);
+    // A frame now and then misses its inputs (another view, a hitch): frame generation only
+    // pauses after several in a row (menus, loading, DLSS off), since each switch can stutter.
+    g_untagged = g_taggedFrame == g_frame ? 0 : g_untagged + 1;
+    SetFrameGeneration(g_set.enabled && g_tagged > 0 && g_untagged < 8);
+    // The overlay's status, read here: Streamline wants it read on the presenting thread.
+    if (g_sl.dlssgGetState && g_presents % 30 == 0) {
+        sl::DLSSGState st{};
+        if (g_sl.dlssgGetState(sl::ViewportHandle(0), st, nullptr) == sl::Result::eOk) g_state = st;
+    }
     Marker(sl::PCLMarker::ePresentStart);
 }
 
@@ -616,14 +626,8 @@ void DrawFrameGenOverlay() {
         return;
     }
     ImGui::TextDisabled("%s", g_fgOn ? "generating frames" : g_set.enabled ? "waiting for DLSS (F9)" : "paused");
-    if (g_sl.dlssgGetState) {
-        sl::DLSSGState st{};
-        if (g_sl.dlssgGetState(sl::ViewportHandle(0), st, nullptr) == sl::Result::eOk) {
-            ImGui::TextDisabled("Frames presented per rendered frame: %u, VRAM %.0f MB, status 0x%x",
-                                st.numFramesActuallyPresented, st.estimatedVRAMUsageInBytes / 1048576.0,
-                                static_cast<unsigned>(st.status));
-        }
-    }
+    ImGui::TextDisabled("Frames presented per rendered frame: %u, status 0x%x", g_state.numFramesActuallyPresented,
+                        static_cast<unsigned>(g_state.status));
     ImGui::TextDisabled("Game frames %llu, with inputs %llu", static_cast<unsigned long long>(g_presents.load()),
                         static_cast<unsigned long long>(g_tagged.load()));
 }
