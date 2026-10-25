@@ -300,6 +300,9 @@ std::map<uint64_t, Link> g_links;
 std::atomic<uint64_t> g_evaluated{0}, g_skipped{0};
 std::string g_error;
 std::map<uint64_t, bool> g_resetByOutput;  // per view
+// Render size per view: a new size (DLSS mode or menu change) starts DLSS and frame generation
+// over, instead of blending in the previous size's frame (a one-frame streak at the bottom edge).
+std::map<uint64_t, uint64_t> g_sizeByOutput;
 bool g_resetAll = true;
 float g_lastJitter[2] = {0, 0};
 unsigned g_lastRender[2] = {0, 0};  // render size of the last view DLSS upscaled
@@ -556,7 +559,12 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     g_lastJitter[0] = jitter[0], g_lastJitter[1] = jitter[1];
     if (g_resetAll) g_resetByOutput.clear(), g_resetAll = false;
     auto rs = g_resetByOutput.find(output.handle);
-    const bool reset = rs == g_resetByOutput.end() || rs->second;
+    const uint64_t size = (static_cast<uint64_t>(rw) << 32) | rh;
+    auto ss = g_sizeByOutput.find(output.handle);
+    const bool resized = ss != g_sizeByOutput.end() && ss->second != size;
+    g_sizeByOutput[output.handle] = size;
+    if (g_sizeByOutput.size() > 64) g_sizeByOutput.clear();
+    const bool reset = rs == g_resetByOutput.end() || rs->second || resized;
 
     cl->dispatch(x, y, z);  // the game's ResolveHistory, with its own bindings
     cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
