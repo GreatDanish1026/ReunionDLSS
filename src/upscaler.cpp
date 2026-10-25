@@ -314,7 +314,7 @@ struct MotionState {
     pipeline pipe = {0};
     bool failed = false;
     int offset = -1;  // byte offset of View.ClipToPrevClip, -1 until found
-    int candidate = -1, hits = 0;
+    int candidate = -1, hits = 0, misses = 0;
     std::map<std::pair<uint64_t, int>, resource_view> views;  // by resource and kind (0 SRV, 1 UAV)
     struct Texture {
         uint32_t width = 0, height = 0;
@@ -338,21 +338,41 @@ bool LooksLikeClipToPrevClip(const float* m) {
     return std::fabs(m[0] - 1) < 0.2f && std::fabs(m[5] - 1) < 0.2f;
 }
 
+// TemporalAAJitter (this frame's jitter, last frame's, in clip units): small, and this frame's
+// x:y proportion matches TSR's jitter in pixels (scaled by the aspect ratio). Matching the
+// proportion rather than the values keeps it independent of how UE scales the view (the DLSS
+// modes change the render size, and an exact match on the size failed there).
+bool LooksLikeJitterRow(const float* r, const float jitter[2], const float size[2]) {
+    for (int i = 0; i < 4; ++i)
+        if (!std::isfinite(r[i]) || std::fabs(r[i]) >= 0.01f) return false;
+    if (r[0] == 0 || r[1] == 0 || (r[2] == 0 && r[3] == 0)) return false;
+    if (std::fabs(jitter[0]) < 0.02f || std::fabs(jitter[1]) < 0.02f) return true;  // can't compare: accept
+    const float want = std::fabs(jitter[0] / jitter[1]) * (size[1] / size[0]);
+    return std::fabs(std::fabs(r[0] / r[1]) / want - 1) < 0.05f;
+}
+
+constexpr int kKnownClipToPrevClip = 2176;  // this game build (docs/FINDINGS.md)
+
 void FindClipToPrevClip(const float* v, const float jitter[2], const float size[2]) {
-    const float jx = std::fabs(jitter[0] * 2 / size[0]), jy = std::fabs(jitter[1] * 2 / size[1]);
-    if (jx < 1e-5f || jy < 1e-5f) return;  // too close to zero to tell apart
+    const auto valid = [&](int byteOffset) {
+        const float* m = v + byteOffset / 4;
+        return LooksLikeClipToPrevClip(m) && LooksLikeJitterRow(m + 32, jitter, size);
+    };
     int found = -1;
-    for (uint32_t i = 32; i + 4 <= kViewScanFloats; i += 4) {
-        if (!Near(std::fabs(v[i]), jx) || !Near(std::fabs(v[i + 1]), jy)) continue;
-        const bool prevJitter = std::fabs(v[i + 2]) < 0.01f && std::fabs(v[i + 3]) < 0.01f &&
-                                (v[i + 2] != 0 || v[i + 3] != 0);
-        if (prevJitter && LooksLikeClipToPrevClip(v + i - 32)) {
-            found = static_cast<int>(i - 32) * 4;
-            break;
-        }
+    if (valid(kKnownClipToPrevClip)) {
+        found = kKnownClipToPrevClip;
+    } else {
+        for (uint32_t i = 32; i + 4 <= kViewScanFloats; i += 4)
+            if (valid(static_cast<int>(i - 32) * 4)) {
+                found = static_cast<int>(i - 32) * 4;
+                break;
+            }
     }
     if (found < 0) {
         g_motion.candidate = -1, g_motion.hits = 0;
+        if (++g_motion.misses == 600)
+            Log("motion: the camera matrix wasn't found in the View uniform buffer (600 tries): DLSS can't run "
+                "(render size %.0fx%.0f, jitter %.3f %.3f)", size[0], size[1], jitter[0], jitter[1]);
         return;
     }
     if (found == g_motion.candidate) ++g_motion.hits;
