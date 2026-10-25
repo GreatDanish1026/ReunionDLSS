@@ -327,47 +327,56 @@ bool EnsureStreamline(IUnknown* queueOrDevice) {
     return true;
 }
 
-// Hands the game Streamline's proxy instead of the swapchain just created on a D3D12 queue.
-template <typename T>
-void Upgrade(IUnknown* queueOrDevice, T** swapchain) {
-    if (!swapchain || !*swapchain) return;
-    ID3D12CommandQueue* queue = nullptr;
-    if (FAILED(queueOrDevice->QueryInterface(IID_PPV_ARGS(&queue)))) return;  // not D3D12
-    queue->Release();
-    void* p = *swapchain;
+// DLSS-G sets itself up while the swapchain is created (its "before CreateSwapChain" hooks), so
+// the game's swapchain is created through Streamline's proxy of the factory the game called,
+// which returns Streamline's proxy swapchain. The proxy factory creates the real swapchain
+// through the same vtable entry: t_creating lets that call through untouched.
+void* UpgradeFactory(IUnknown* factory) {
+    factory->AddRef();  // the proxy takes this reference
+    void* p = factory;
     const sl::Result r = g_sl.upgradeInterface(&p);
-    if (r != sl::Result::eOk || !p) {
-        Log("frame generation: slUpgradeInterface(swapchain) failed: %d", static_cast<int>(r));
-        return;
+    if (r != sl::Result::eOk || !p || p == factory) {
+        factory->Release();
+        Log("frame generation: slUpgradeInterface(factory) failed: %d", static_cast<int>(r));
+        return nullptr;
     }
-    *swapchain = static_cast<T*>(p);
-    IDXGISwapChain1* sc = static_cast<IDXGISwapChain1*>(p);
+    return p;
+}
+
+void HookProxyPresent(IDXGISwapChain* sc) {
     const bool hooked = Patch(sc, 8, reinterpret_cast<void*>(&HookPresent), reinterpret_cast<void**>(&g_present)) &&
                         Patch(sc, 22, reinterpret_cast<void*>(&HookPresent1), reinterpret_cast<void**>(&g_present1));
     g_upgraded = hooked;
-    Log("frame generation: swapchain handed to Streamline%s", hooked ? "" : " (present hook FAILED)");
+    Log("frame generation: swapchain created through Streamline%s", hooked ? "" : " (present hook FAILED)");
 }
 
 HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
     void* caller = _ReturnAddress();
-    if (t_creating || CalledFromStreamline(caller)) return g_createSwapChain(f, dev, desc, out);
+    if (t_creating || CalledFromStreamline(caller) || !EnsureStreamline(dev)) return g_createSwapChain(f, dev, desc, out);
+    void* proxy = UpgradeFactory(f);
+    if (!proxy) return g_createSwapChain(f, dev, desc, out);
     t_creating = true;
-    const bool sl = EnsureStreamline(dev);
-    const HRESULT hr = g_createSwapChain(f, dev, desc, out);
-    if (SUCCEEDED(hr) && sl) Upgrade(dev, out);
+    const HRESULT hr = static_cast<IDXGIFactory*>(proxy)->CreateSwapChain(dev, desc, out);
     t_creating = false;
+    static_cast<IUnknown*>(proxy)->Release();
+    if (SUCCEEDED(hr) && out && *out) HookProxyPresent(*out);
+    else Log("frame generation: CreateSwapChain through Streamline failed: 0x%08lx", static_cast<unsigned long>(hr));
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                             const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* output, IDXGISwapChain1** out) {
     void* caller = _ReturnAddress();
-    if (t_creating || CalledFromStreamline(caller)) return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
+    if (t_creating || CalledFromStreamline(caller) || !EnsureStreamline(dev))
+        return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
+    void* proxy = UpgradeFactory(f);
+    if (!proxy) return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
     t_creating = true;
-    const bool sl = EnsureStreamline(dev);
-    const HRESULT hr = g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
-    if (SUCCEEDED(hr) && sl) Upgrade(dev, out);
+    const HRESULT hr = static_cast<IDXGIFactory2*>(proxy)->CreateSwapChainForHwnd(dev, hwnd, desc, fs, output, out);
     t_creating = false;
+    static_cast<IUnknown*>(proxy)->Release();
+    if (SUCCEEDED(hr) && out && *out) HookProxyPresent(*out);
+    else Log("frame generation: CreateSwapChainForHwnd through Streamline failed: 0x%08lx", static_cast<unsigned long>(hr));
     return hr;
 }
 
