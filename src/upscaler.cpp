@@ -455,6 +455,7 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     float params[20];
     const float* m = view.data() + g_motion.offset / 4;
     memcpy(params, m, 16 * sizeof(float));
+    FrameGenSetCamera(view.data(), g_motion.offset);
     params[16] = size[0], params[17] = size[1], params[18] = 1 / size[0], params[19] = 1 / size[1];
 
     cl->barrier(tex, resource_usage::shader_resource_non_pixel, resource_usage::unordered_access);
@@ -570,6 +571,8 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
     Restore(cl, s);
     if (ok) {
+        FrameGenTag(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in.depth, in.motion, rw, rh, in.jitterX,
+                    in.jitterY, reset);
         g_resetByOutput[output.handle] = false;
         g_error.clear();
         if (++g_evaluated == 1) Log("DLSS: first frame evaluated");

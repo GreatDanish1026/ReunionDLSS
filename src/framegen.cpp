@@ -1,0 +1,577 @@
+// DLSS Frame Generation through NVIDIA Streamline 2.14.16 (manual hooking).
+//
+// Streamline's frame generation lives in a proxy swapchain. When the game's D3D12 device is
+// created, Streamline is loaded from Win64\streamline\ (signature checked) and the real DXGI
+// factory's CreateSwapChain / CreateSwapChainForHwnd are hooked, so the swapchain the game gets
+// is Streamline's proxy. Its Present is hooked too: that's where each game frame ends (Reflex
+// latency markers, the frame token, frame generation on or off).
+//
+// Per frame, at the point DLSS upscales (upscaler.cpp), the depth, our motion vectors and the
+// camera constants (from the View uniform buffer) are handed to Streamline. Frames without them
+// (menus, loading, DLSS off) are presented without generated frames.
+//
+// Loading Streamline only happens if frame generation was on at launch: switching it on later
+// asks for a restart, switching it off is live.
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <intrin.h>
+
+#include "common.hpp"
+
+#include <sl.h>
+#include <sl_consts.h>
+#include <sl_dlss_g.h>
+#include <sl_pcl.h>
+#include <sl_reflex.h>
+#include <sl_security.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <mutex>
+#include <string>
+
+#include "version.h"
+
+using namespace reshade::api;
+
+namespace rd {
+namespace {
+
+constexpr const char* kProjectId = "6f1d6e2a-5b8c-4f2e-9a43-7c2b8e1d4a90";
+
+// Byte offsets in UE 5.6's View uniform buffer (FViewUniformShaderParameters), checked against
+// the buffer at run time (docs/FINDINGS.md).
+constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 64, kViewToTranslatedWorld = 256,
+                   kViewToClip = 448, kViewToClipNoAA = 512;
+
+struct Settings {
+    bool enabled = false;
+} g_set;
+
+struct SlApi {
+    HMODULE mod = nullptr;
+    PFun_slInit* init = nullptr;
+    PFun_slShutdown* shutdown = nullptr;
+    PFun_slIsFeatureSupported* isFeatureSupported = nullptr;
+    PFun_slGetFeatureRequirements* getFeatureRequirements = nullptr;
+    PFun_slSetTagForFrame* setTagForFrame = nullptr;
+    PFun_slSetConstants* setConstants = nullptr;
+    PFun_slGetFeatureFunction* getFeatureFunction = nullptr;
+    PFun_slGetNewFrameToken* getNewFrameToken = nullptr;
+    PFun_slSetD3DDevice* setD3DDevice = nullptr;
+    PFun_slUpgradeInterface* upgradeInterface = nullptr;
+    PFun_slDLSSGSetOptions* dlssgSetOptions = nullptr;
+    PFun_slDLSSGGetState* dlssgGetState = nullptr;
+    PFun_slReflexSetOptions* reflexSetOptions = nullptr;
+    PFun_slReflexSleep* reflexSleep = nullptr;
+    PFun_slPCLSetMarker* pclSetMarker = nullptr;
+} g_sl;
+
+std::mutex g_mutex;
+bool g_initTried = false, g_ready = false;
+std::atomic<bool> g_upgraded{false};  // the game's swapchain is Streamline's proxy
+std::string g_status = "off";
+
+// Frames: the token of the frame being recorded; it advances after each game present.
+sl::FrameToken* g_token = nullptr;
+uint32_t g_frame = 0;
+uint32_t g_taggedFrame = UINT32_MAX;  // last frame that got depth, motion and constants
+bool g_fgOn = false;                  // what Streamline was last told
+std::atomic<uint64_t> g_presents{0}, g_tagged{0};
+
+// The camera, copied from the View uniform buffer when our motion vectors are computed.
+struct Camera {
+    float m[5][16];  // TranslatedWorldToClip, RelativeWorldToClip, ViewToTranslatedWorld, ViewToClipNoAA, ClipToPrevClip
+    bool valid = false;
+} g_camera;
+bool g_cameraChecked = false, g_cameraOk = false;
+
+// ---------------------------------------------------------------- matrices (row-major, row vector * matrix)
+
+bool Invert(const float* m, float* out) {
+    float inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const double det = static_cast<double>(m[0]) * inv[0] + static_cast<double>(m[1]) * inv[4] +
+                       static_cast<double>(m[2]) * inv[8] + static_cast<double>(m[3]) * inv[12];
+    if (det == 0 || !std::isfinite(det)) return false;
+    for (int i = 0; i < 16; ++i) out[i] = static_cast<float>(inv[i] / det);
+    return true;
+}
+
+void Multiply(const float* a, const float* b, float* out) {
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            double s = 0;
+            for (int k = 0; k < 4; ++k) s += static_cast<double>(a[r * 4 + k]) * b[k * 4 + c];
+            out[r * 4 + c] = static_cast<float>(s);
+        }
+}
+
+void ToSl(sl::float4x4& d, const float* s) {
+    for (uint32_t r = 0; r < 4; ++r) d.setRow(r, sl::float4(s[r * 4], s[r * 4 + 1], s[r * 4 + 2], s[r * 4 + 3]));
+}
+
+// The View buffer layout this code assumes, checked once: the unjittered projection is a
+// reversed-Z perspective matrix (w = view z) matching the jittered one apart from the jitter.
+bool CheckCamera(const float* view) {
+    const float* p = view + kViewToClipNoAA / 4;
+    const float* pj = view + kViewToClip / 4;
+    const float* axes = view + kViewToTranslatedWorld / 4;
+    const auto len = [](const float* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+    const bool ok = p[0] > 0.1f && p[5] > 0.1f && std::fabs(p[11] - 1) < 1e-4f && std::fabs(p[15]) < 1e-4f &&
+                    std::fabs(p[0] - pj[0]) < 1e-4f && std::fabs(p[5] - pj[5]) < 1e-4f && p[14] > 0 &&
+                    std::fabs(len(axes) - 1) < 1e-3f && std::fabs(len(axes + 4) - 1) < 1e-3f &&
+                    std::fabs(len(axes + 8) - 1) < 1e-3f;
+    Log("frame generation: View buffer check %s (projection %.4f %.4f near %.3f, axes %.3f %.3f %.3f)",
+        ok ? "passed" : "FAILED", p[0], p[5], p[14], len(axes), len(axes + 4), len(axes + 8));
+    return ok;
+}
+
+// ---------------------------------------------------------------- frames, Reflex and DLSS-G options
+
+void Marker(sl::PCLMarker m) {
+    if (g_sl.pclSetMarker && g_token) g_sl.pclSetMarker(m, *g_token);
+}
+
+void SetFrameGeneration(bool on) {
+    if (on == g_fgOn || !g_sl.dlssgSetOptions) return;
+    sl::DLSSGOptions o{};
+    o.mode = on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+    o.numFramesToGenerate = 1;
+    o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+    const sl::Result r = g_sl.dlssgSetOptions(sl::ViewportHandle(0), o);
+    if (r != sl::Result::eOk) Log("frame generation: slDLSSGSetOptions(%s) failed: %d", on ? "on" : "off", static_cast<int>(r));
+    else Log("frame generation %s", on ? "running" : "paused");
+    g_fgOn = on;
+}
+
+void BeforePresent() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_ready) return;
+    ++g_presents;
+    Marker(sl::PCLMarker::eRenderSubmitEnd);
+    SetFrameGeneration(g_set.enabled && g_taggedFrame == g_frame);
+    Marker(sl::PCLMarker::ePresentStart);
+}
+
+void AfterPresent() {
+    sl::FrameToken* token = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_ready) return;
+        Marker(sl::PCLMarker::ePresentEnd);
+        const uint32_t next = g_frame + 1;
+        if (g_sl.getNewFrameToken(token, &next) != sl::Result::eOk || !token) return;
+        g_token = token, g_frame = next;
+    }
+    // The add-on only runs on the render thread: the next frame starts here. Reflex's sleep
+    // runs without the lock (the overlay and the TSR hook take it).
+    if (g_sl.reflexSleep) g_sl.reflexSleep(*token);
+    g_sl.pclSetMarker(sl::PCLMarker::eSimulationStart, *token);
+    g_sl.pclSetMarker(sl::PCLMarker::eSimulationEnd, *token);
+    g_sl.pclSetMarker(sl::PCLMarker::eRenderSubmitStart, *token);
+}
+
+// ---------------------------------------------------------------- vtable hooks
+
+bool Patch(void* object, int slot, void* hook, void** original) {
+    void** vtable = *static_cast<void***>(object);
+    if (vtable[slot] == hook) return true;  // already ours
+    DWORD old = 0;
+    if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_READWRITE, &old)) return false;
+    *original = vtable[slot];
+    vtable[slot] = hook;
+    VirtualProtect(&vtable[slot], sizeof(void*), old, &old);
+    return true;
+}
+
+using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using CreateForHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+                                                    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+PresentFn g_present = nullptr;
+Present1Fn g_present1 = nullptr;
+CreateSwapChainFn g_createSwapChain = nullptr;
+CreateForHwndFn g_createForHwnd = nullptr;
+
+HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
+    const bool frame = (flags & DXGI_PRESENT_TEST) == 0;
+    if (frame) BeforePresent();
+    const HRESULT hr = g_present(sc, sync, flags);
+    if (frame) AfterPresent();
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
+    const bool frame = (flags & DXGI_PRESENT_TEST) == 0;
+    if (frame) BeforePresent();
+    const HRESULT hr = g_present1(sc, sync, flags, p);
+    if (frame) AfterPresent();
+    return hr;
+}
+
+// Streamline creates swapchains of its own through the same factory: those stay as they are.
+bool CalledFromStreamline(void* returnAddress) {
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(returnAddress), &mod))
+        return false;
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(mod, path, MAX_PATH);
+    const wchar_t* name = wcsrchr(path, L'\\');
+    name = name ? name + 1 : path;
+    return _wcsnicmp(name, L"sl.", 3) == 0 || _wcsnicmp(name, L"nvngx", 5) == 0;
+}
+
+thread_local bool t_creating = false;
+
+// Hands the game Streamline's proxy instead of the swapchain just created on a D3D12 queue.
+template <typename T>
+void Upgrade(IUnknown* queueOrDevice, T** swapchain) {
+    if (!swapchain || !*swapchain) return;
+    ID3D12CommandQueue* queue = nullptr;
+    if (FAILED(queueOrDevice->QueryInterface(IID_PPV_ARGS(&queue)))) return;  // not D3D12
+    queue->Release();
+    void* p = *swapchain;
+    const sl::Result r = g_sl.upgradeInterface(&p);
+    if (r != sl::Result::eOk || !p) {
+        Log("frame generation: slUpgradeInterface(swapchain) failed: %d", static_cast<int>(r));
+        return;
+    }
+    *swapchain = static_cast<T*>(p);
+    IDXGISwapChain1* sc = static_cast<IDXGISwapChain1*>(p);
+    const bool hooked = Patch(sc, 8, reinterpret_cast<void*>(&HookPresent), reinterpret_cast<void**>(&g_present)) &&
+                        Patch(sc, 22, reinterpret_cast<void*>(&HookPresent1), reinterpret_cast<void**>(&g_present1));
+    g_upgraded = hooked;
+    Log("frame generation: swapchain handed to Streamline%s", hooked ? "" : " (present hook FAILED)");
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
+    void* caller = _ReturnAddress();
+    if (t_creating || CalledFromStreamline(caller)) return g_createSwapChain(f, dev, desc, out);
+    t_creating = true;
+    const HRESULT hr = g_createSwapChain(f, dev, desc, out);
+    if (SUCCEEDED(hr) && dev) Upgrade(dev, out);
+    t_creating = false;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                            const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* output, IDXGISwapChain1** out) {
+    void* caller = _ReturnAddress();
+    if (t_creating || CalledFromStreamline(caller)) return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
+    t_creating = true;
+    const HRESULT hr = g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
+    if (SUCCEEDED(hr) && dev) Upgrade(dev, out);
+    t_creating = false;
+    return hr;
+}
+
+// Hooks the system DXGI factory's vtable (shared by every factory, ReShade's hooks included).
+bool HookFactory(std::string& error) {
+    wchar_t sys[MAX_PATH] = {};
+    GetSystemDirectoryW(sys, MAX_PATH);
+    HMODULE dxgi = LoadLibraryW((std::wstring(sys) + L"\\dxgi.dll").c_str());
+    using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
+    auto create = dxgi ? reinterpret_cast<CreateFactory2>(GetProcAddress(dxgi, "CreateDXGIFactory2")) : nullptr;
+    IDXGIFactory2* factory = nullptr;
+    if (!create || FAILED(create(0, IID_PPV_ARGS(&factory)))) {
+        error = "couldn't create a DXGI factory";
+        return false;
+    }
+    const bool ok = Patch(factory, 10, reinterpret_cast<void*>(&HookCreateSwapChain), reinterpret_cast<void**>(&g_createSwapChain)) &&
+                    Patch(factory, 15, reinterpret_cast<void*>(&HookCreateForHwnd), reinterpret_cast<void**>(&g_createForHwnd));
+    factory->Release();
+    if (!ok) error = "couldn't hook swapchain creation";
+    return ok;
+}
+
+// ---------------------------------------------------------------- Streamline
+
+void OnSlLog(sl::LogType type, const char* msg) {
+    if (type == sl::LogType::eInfo) return;  // Streamline's own log file has them
+    std::string s = msg ? msg : "";
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    Log("streamline %s: %s", type == sl::LogType::eError ? "error" : "warning", s.c_str());
+}
+
+template <typename T>
+bool Proc(T*& fn, const char* name) {
+    fn = reinterpret_cast<T*>(GetProcAddress(g_sl.mod, name));
+    return fn != nullptr;
+}
+
+template <typename T>
+void Feature(sl::Feature f, T*& fn, const char* name) {
+    void* p = nullptr;
+    fn = g_sl.getFeatureFunction(f, name, p) == sl::Result::eOk ? reinterpret_cast<T*>(p) : nullptr;
+    if (!fn) Log("frame generation: %s not available", name);
+}
+
+bool InitStreamline(ID3D12Device* device, std::string& error) {
+    static std::wstring dir;
+    dir = ExeDir() + L"streamline\\";
+    const std::wstring interposer = dir + L"sl.interposer.dll";
+    if (GetFileAttributesW(interposer.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        error = "streamline\\sl.interposer.dll missing next to the game";
+        return false;
+    }
+    if (!sl::security::verifyEmbeddedSignature(interposer.c_str())) {
+        error = "sl.interposer.dll isn't signed by NVIDIA";
+        return false;
+    }
+    g_sl.mod = LoadLibraryW(interposer.c_str());
+    if (!g_sl.mod || !Proc(g_sl.init, "slInit") || !Proc(g_sl.shutdown, "slShutdown") ||
+        !Proc(g_sl.isFeatureSupported, "slIsFeatureSupported") || !Proc(g_sl.getFeatureRequirements, "slGetFeatureRequirements") ||
+        !Proc(g_sl.setTagForFrame, "slSetTagForFrame") || !Proc(g_sl.setConstants, "slSetConstants") ||
+        !Proc(g_sl.getFeatureFunction, "slGetFeatureFunction") || !Proc(g_sl.getNewFrameToken, "slGetNewFrameToken") ||
+        !Proc(g_sl.setD3DDevice, "slSetD3DDevice") || !Proc(g_sl.upgradeInterface, "slUpgradeInterface")) {
+        error = "couldn't load sl.interposer.dll";
+        return false;
+    }
+
+    sl::Preferences pref{};
+    const wchar_t* paths[] = {dir.c_str()};
+    pref.pathsToPlugins = paths;
+    pref.numPathsToPlugins = 1;
+    pref.pathToLogsAndData = dir.c_str();  // sl.log
+    pref.logLevel = sl::LogLevel::eDefault;
+    pref.logMessageCallback = &OnSlLog;
+    // No over-the-air updates: only the DLLs that ship with the add-on are used.
+    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseManualHooking |
+                 sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+    static const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+    pref.featuresToLoad = features;
+    pref.numFeaturesToLoad = 3;
+    pref.engine = sl::EngineType::eUnreal;
+    pref.engineVersion = "5.6";
+    pref.projectId = kProjectId;
+    pref.renderAPI = sl::RenderAPI::eD3D12;
+    sl::Result r = g_sl.init(pref, sl::kSDKVersion);
+    if (r != sl::Result::eOk) {
+        error = "slInit failed (" + std::to_string(static_cast<int>(r)) + ")";
+        return false;
+    }
+    r = g_sl.setD3DDevice(device);
+    if (r != sl::Result::eOk) {
+        error = "slSetD3DDevice failed (" + std::to_string(static_cast<int>(r)) + ")";
+        return false;
+    }
+    LUID luid = device->GetAdapterLuid();
+    sl::AdapterInfo adapter{};
+    adapter.deviceLUID = reinterpret_cast<uint8_t*>(&luid);
+    adapter.deviceLUIDSizeInBytes = sizeof(luid);
+    r = g_sl.isFeatureSupported(sl::kFeatureDLSS_G, adapter);
+    if (r != sl::Result::eOk) {
+        error = "DLSS Frame Generation not supported here (" + std::to_string(static_cast<int>(r)) +
+                "): needs an RTX 40/50, a recent driver and hardware-accelerated GPU scheduling";
+        return false;
+    }
+    sl::FeatureRequirements req{};
+    if (g_sl.getFeatureRequirements(sl::kFeatureDLSS_G, req) == sl::Result::eOk)
+        Log("frame generation: requirements flags 0x%x", static_cast<unsigned>(req.flags));
+
+    Feature(sl::kFeatureDLSS_G, g_sl.dlssgSetOptions, "slDLSSGSetOptions");
+    Feature(sl::kFeatureDLSS_G, g_sl.dlssgGetState, "slDLSSGGetState");
+    Feature(sl::kFeatureReflex, g_sl.reflexSetOptions, "slReflexSetOptions");
+    Feature(sl::kFeatureReflex, g_sl.reflexSleep, "slReflexSleep");
+    Feature(sl::kFeaturePCL, g_sl.pclSetMarker, "slPCLSetMarker");
+    if (!g_sl.dlssgSetOptions || !g_sl.reflexSetOptions || !g_sl.pclSetMarker) {
+        error = "Streamline features missing (see the log)";
+        return false;
+    }
+    sl::ReflexOptions reflex{};
+    reflex.mode = sl::ReflexMode::eLowLatency;  // DLSS-G requires Reflex
+    r = g_sl.reflexSetOptions(reflex);
+    if (r != sl::Result::eOk) Log("frame generation: slReflexSetOptions failed: %d", static_cast<int>(r));
+    const uint32_t first = 0;
+    if (g_sl.getNewFrameToken(g_token, &first) != sl::Result::eOk) {
+        error = "slGetNewFrameToken failed";
+        return false;
+    }
+    g_frame = 0;
+    return HookFactory(error);
+}
+
+void OnInitDevice(device* dev) {
+    if (dev->get_api() != device_api::d3d12) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_initTried) return;
+    g_initTried = true;
+    if (!g_set.enabled) {
+        g_status = "off";
+        return;
+    }
+    std::string err;
+    if (!InitStreamline(reinterpret_cast<ID3D12Device*>(dev->get_native()), err)) {
+        g_status = err;
+        Log("frame generation: %s", err.c_str());
+        return;
+    }
+    g_ready = true;
+    g_status = "ready";
+    Log("frame generation: Streamline 2.14 loaded, waiting for the swapchain");
+}
+
+void OnDestroyDevice(device* dev) {
+    if (dev->get_api() != device_api::d3d12) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_ready) return;
+    g_ready = false;
+    g_sl.shutdown();
+    g_status = "shut down";
+}
+
+}  // namespace
+
+void FrameGenSetCamera(const float* view, int clipToPrevClipOffset) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_ready || clipToPrevClipOffset < 0) return;
+    if (!g_cameraChecked) g_cameraChecked = true, g_cameraOk = CheckCamera(view);
+    if (!g_cameraOk) return;
+    memcpy(g_camera.m[0], view + kTranslatedWorldToClip / 4, 64);
+    memcpy(g_camera.m[1], view + kRelativeWorldToClip / 4, 64);
+    memcpy(g_camera.m[2], view + kViewToTranslatedWorld / 4, 64);
+    memcpy(g_camera.m[3], view + kViewToClipNoAA / 4, 64);
+    memcpy(g_camera.m[4], view + clipToPrevClipOffset / 4, 64);
+    g_camera.valid = true;
+}
+
+void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned rw,
+                 unsigned rh, float jitterX, float jitterY, bool reset) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_ready || !g_set.enabled || !g_token || !g_camera.valid || g_taggedFrame == g_frame) return;
+    const Camera& cam = g_camera;
+    sl::Constants c{};
+    float inv[16], prevToCur[16], m[16];
+    ToSl(c.cameraViewToClip, cam.m[3]);
+    if (!Invert(cam.m[3], inv) || !Invert(cam.m[4], prevToCur)) return;
+    ToSl(c.clipToCameraView, inv);
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    ToSl(c.clipToLensClip, identity);
+    ToSl(c.clipToPrevClip, cam.m[4]);
+    ToSl(c.prevClipToClip, prevToCur);
+    c.jitterOffset = sl::float2(jitterX, jitterY);
+    c.mvecScale = sl::float2(1.0f / rw, 1.0f / rh);  // our motion vectors are in render pixels
+    c.cameraPinholeOffset = sl::float2(0, 0);
+    // Camera position in UE's relative world (the world tile): RelativeWorldToClip =
+    // T(tile - camera) * TranslatedWorldToClip.
+    float invTw[16];
+    if (Invert(cam.m[0], invTw)) {
+        Multiply(cam.m[1], invTw, m);
+        c.cameraPos = sl::float3(-m[12], -m[13], -m[14]);
+    } else {
+        c.cameraPos = sl::float3(0, 0, 0);
+    }
+    const float* axes = cam.m[2];  // view x right, y up, z forward
+    c.cameraRight = sl::float3(axes[0], axes[1], axes[2]);
+    c.cameraUp = sl::float3(axes[4], axes[5], axes[6]);
+    c.cameraFwd = sl::float3(axes[8], axes[9], axes[10]);
+    const float* p = cam.m[3];
+    c.cameraNear = p[14];
+    c.cameraFar = 1e6f;  // UE's projection has no far plane
+    c.cameraFOV = 2 * std::atan(1 / p[5]);
+    c.cameraAspectRatio = p[5] / p[0];
+    c.depthInverted = sl::Boolean::eTrue;
+    c.cameraMotionIncluded = sl::Boolean::eTrue;
+    c.motionVectors3D = sl::Boolean::eFalse;
+    c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    c.orthographicProjection = sl::Boolean::eFalse;
+    c.motionVectorsDilated = sl::Boolean::eFalse;
+    c.motionVectorsJittered = sl::Boolean::eFalse;
+    sl::Result r = g_sl.setConstants(c, *g_token, sl::ViewportHandle(0));
+    if (r != sl::Result::eOk) {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
+        return;
+    }
+    // Depth: UE's scene depth (reused later in the frame: Streamline copies it now).
+    // Motion: our own texture, unchanged until the next frame.
+    sl::Resource depthRes(sl::ResourceType::eTex2d, depth, nullptr, nullptr,
+                          D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    sl::Resource motionRes(sl::ResourceType::eTex2d, motion, nullptr, nullptr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::Extent extent{0, 0, rw, rh};
+    const sl::ResourceTag tags[2] = {sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent),
+                                     sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent)};
+    r = g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, 2, list);
+    if (r != sl::Result::eOk) {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
+        return;
+    }
+    g_taggedFrame = g_frame;
+    if (++g_tagged == 1) Log("frame generation: first frame tagged (%ux%u)", rw, rh);
+}
+
+void RegisterFrameGen() {
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FrameGeneration", g_set.enabled);
+    reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
+    reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
+}
+
+void UnregisterFrameGen() {
+    reshade::unregister_event<reshade::addon_event::init_device>(&OnInitDevice);
+    reshade::unregister_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
+}
+
+void DrawFrameGenOverlay() {
+    ImGui::SeparatorText("Frame generation (DLSS-G)");
+    bool on = g_set.enabled;
+    if (ImGui::Checkbox("Frame generation", &on)) {
+        g_set.enabled = on;
+        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGeneration", on);
+        Log("settings: frame generation %s", on ? "on" : "off");
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_set.enabled && !g_ready) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", g_initTried && g_status != "off" ? g_status.c_str()
+                                                                                           : "restart the game to load it");
+        return;
+    }
+    if (!g_ready) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("off");
+        return;
+    }
+    ImGui::SameLine();
+    if (!g_upgraded) {
+        ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "the game's swapchain wasn't handed to Streamline (see the log)");
+        return;
+    }
+    ImGui::TextDisabled("%s", g_fgOn ? "generating frames" : g_set.enabled ? "waiting for DLSS (F9)" : "paused");
+    if (g_sl.dlssgGetState) {
+        sl::DLSSGState st{};
+        if (g_sl.dlssgGetState(sl::ViewportHandle(0), st, nullptr) == sl::Result::eOk) {
+            ImGui::TextDisabled("Frames presented per rendered frame: %u, VRAM %.0f MB, status 0x%x",
+                                st.numFramesActuallyPresented, st.estimatedVRAMUsageInBytes / 1048576.0,
+                                static_cast<unsigned>(st.status));
+        }
+    }
+    ImGui::TextDisabled("Game frames %llu, with inputs %llu", static_cast<unsigned long long>(g_presents.load()),
+                        static_cast<unsigned long long>(g_tagged.load()));
+}
+
+}  // namespace rd

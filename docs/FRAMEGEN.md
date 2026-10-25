@@ -43,3 +43,21 @@ requires the latency-marker plugin separately.
 
 NVIDIA Smooth Motion (NVIDIA App → Graphics → program settings, RTX 40/50, DX12) generates
 frames in the driver with no game inputs. Works today; lower quality on UI and fast motion.
+
+## State (0.3.0, 2026-10-25)
+
+Implemented in `src/framegen.cpp`, not yet tested in game. Off by default (`FrameGeneration` in
+ReShade.ini); switching it on in the overlay needs a game restart, since Streamline has to be
+loaded before the swapchain exists. Streamline logs to `Win64\streamline\sl.log`.
+- Streamline loads at ReShade's `init_device` (D3D12), then the system DXGI factory's vtable
+  slots 10 (CreateSwapChain) and 15 (CreateSwapChainForHwnd) are hooked; the new swapchain goes
+  through `slUpgradeInterface`, and the proxy's Present (8) and Present1 (22) are hooked.
+- Per game frame (proxy Present): RenderSubmitEnd, frame generation on only if this frame was
+  tagged, PresentStart / PresentEnd, next frame token, `slReflexSleep`, SimulationStart/End,
+  RenderSubmitStart.
+- Tags at ResolveHistory, after DLSS: depth (eOnlyValidNow, state 0xe0), our motion vectors
+  (eValidUntilPresent, non-pixel SR), extent = render size, mvecScale = 1 / render size.
+- Constants from the View UB: ViewToClipNoAA at 512 (checked against ViewToClip at 448),
+  ClipToPrevClip, ViewToTranslatedWorld at 256 (axes), camera position from RelativeWorldToClip
+  (64) and TranslatedWorldToClip (0). Far plane 1e6 (UE's is infinite).
+- No hudless or UI buffers yet: the HUD will smear in generated frames.

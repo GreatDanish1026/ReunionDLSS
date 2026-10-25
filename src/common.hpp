@@ -11,6 +11,9 @@
 #include <cstdint>
 #include <string>
 
+struct ID3D12GraphicsCommandList;
+struct ID3D12Resource;
+
 namespace rd {
 
 // ReunionDLSS.log next to the game exe.
@@ -34,5 +37,16 @@ constexpr uint32_t kTsrResolveHistory = 0x60acc0c7;
 void RegisterUpscaler();
 void UnregisterUpscaler();
 void DrawUpscalerOverlay();
+
+// framegen.cpp: DLSS Frame Generation through Streamline.
+void RegisterFrameGen();
+void UnregisterFrameGen();
+void DrawFrameGenOverlay();
+// The View uniform buffer (first 16 KB) of this frame's main view, with View.ClipToPrevClip's offset.
+void FrameGenSetCamera(const float* view, int clipToPrevClipOffset);
+// This frame's depth (UE's, state depth read + shader resource) and our motion vectors (render
+// pixels, previous minus current; state non-pixel shader resource), tagged on <list>.
+void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned renderWidth,
+                 unsigned renderHeight, float jitterX, float jitterY, bool reset);
 
 }  // namespace rd

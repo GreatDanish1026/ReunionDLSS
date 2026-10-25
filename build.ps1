@@ -24,8 +24,8 @@ $cmd = @(
     "call `"$vcvars`" >nul",
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kMotionCs /Fh `"$obj\motion_cs.h`" `"$root\src\motion.hlsl`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
-     "/I `"$obj`" /I `"$root\third_party\imgui`" /I`"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" " +
-     "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" `"$root\src\upscaler.cpp`" `"$root\src\dlss.cpp`" user32.lib advapi32.lib ole32.lib d3d12.lib dxgi.lib `"$root\third_party\dlss\lib\nvsdk_ngx_s.lib`" " +
+     "/I `"$obj`" /I `"$root\third_party\imgui`" /I`"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" /I `"$root\third_party\streamline\include`" " +
+     "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" `"$root\src\upscaler.cpp`" `"$root\src\dlss.cpp`" `"$root\src\framegen.cpp`" user32.lib advapi32.lib ole32.lib d3d12.lib dxgi.lib `"$root\third_party\dlss\lib\nvsdk_ngx_s.lib`" " +
      "/link /DLL /OUT:`"$addon`" /PDB:`"$obj\ReunionDLSS.pdb`" /DEBUG")
 ) -join " && "
 cmd /c $cmd
@@ -36,5 +36,13 @@ if ($Install) {
     if (-not (Test-Path "$GameBin\$exe")) { throw "$exe not found in $GameBin (pass -GameBin)" }
     if (Get-Process ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue) { throw "Close the game first." }
     Copy-Item $addon $GameBin -Force
+    # Streamline 2.14.16 (NVIDIA-signed) for frame generation: Win64\streamline\
+    $sl = "$root\third_party\streamline\bin\x64"
+    New-Item -ItemType Directory -Force "$GameBin\streamline" | Out-Null
+    foreach ($f in "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll") {
+        Copy-Item "$sl\$f" "$GameBin\streamline" -Force
+    }
+    Copy-Item "$root\third_party\streamline\license.txt" "$GameBin\streamline\streamline.license.txt" -Force
+    Copy-Item "$sl\reflex.license.txt" "$GameBin\streamline" -Force
     Write-Host "Installed to $GameBin"
 }

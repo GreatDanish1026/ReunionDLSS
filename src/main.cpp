@@ -554,6 +554,7 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
 void DrawOverlay(effect_runtime*) {
     ImGui::TextDisabled(RD_PRODUCT " " RD_VERSION " (in development)");
     rd::DrawUpscalerOverlay();
+    rd::DrawFrameGenOverlay();
     ImGui::SeparatorText("Frame capture (for development)");
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
     if (ImGui::Button("Capture frame (F10)")) StartCapture();
@@ -593,6 +594,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             OpenLog();
             descriptor_tracking::register_events();
             rd::RegisterUpscaler();
+            rd::RegisterFrameGen();
             reshade::register_event<reshade::addon_event::init_pipeline>(&OnInitPipeline);
             reshade::register_event<reshade::addon_event::destroy_pipeline>(&OnDestroyPipeline);
             reshade::register_event<reshade::addon_event::reset_command_list>(&OnReset);
@@ -613,6 +615,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             reshade::register_overlay(RD_PRODUCT, &DrawOverlay);
             break;
         case DLL_PROCESS_DETACH:
+            rd::UnregisterFrameGen();
             rd::UnregisterUpscaler();
             descriptor_tracking::unregister_events();
             reshade::unregister_addon(module);
