@@ -39,7 +39,9 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
+#include "ui_alpha_cs.h"  // kUiAlphaCs: ui_alpha.hlsl compiled by build.ps1
 #include "version.h"
 
 using namespace reshade::api;
@@ -62,6 +64,10 @@ const char* const kModeNames[kModeCount] = {"Off", "2x", "3x", "4x", "Dynamic"};
 struct Settings {
     int mode = kOff;
     bool enabled = false;  // mode != kOff
+    // sl::Constants::minRelativeLinearDepthObjectSeparation: how far apart in depth two surfaces
+    // must be for DLSS-G to treat them as separate objects, in units of 1 / device depth. UE's
+    // near plane is 10 cm, so NVIDIA's default 40 is 4 m.
+    float separation = 40;
 } g_set;
 
 uint32_t g_maxFrames = 1;  // DLSSGState::numFramesToGenerateMax
@@ -113,6 +119,26 @@ resource g_hudlessTex = {0};
 resource g_uiReadback = {0};  // one row of the HUD layer, for its check
 device* g_hudlessDevice = nullptr;
 std::atomic<uint64_t> g_hudlessCount{0};
+
+// The HUD mask: ui_alpha.hlsl writes the layer's alpha (flipped if inverted) to an r8 texture.
+struct MaskState {
+    pipeline_layout layout = {0};
+    pipeline pipe = {0};
+    bool failed = false;
+    resource tex = {0};
+    resource_view uav = {0};
+    std::vector<std::pair<uint64_t, resource_view>> srvs;  // per HUD layer texture
+} g_mask;
+
+void DestroyMask(device* dev) {
+    for (auto& [h, v] : g_mask.srvs) dev->destroy_resource_view(v);
+    if (g_mask.uav.handle) dev->destroy_resource_view(g_mask.uav);
+    if (g_mask.tex.handle) dev->destroy_resource(g_mask.tex);
+    if (g_mask.pipe.handle) dev->destroy_pipeline(g_mask.pipe);
+    if (g_mask.layout.handle) dev->destroy_pipeline_layout(g_mask.layout);
+    g_mask = MaskState();
+}
+
 bool g_fgOn = false;                  // what Streamline was last told
 std::atomic<uint64_t> g_presents{0}, g_tagged{0};
 uint32_t g_untagged = 0;  // game frames in a row without inputs
@@ -583,6 +609,7 @@ void OnDestroyDevice(device* dev) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_hudlessTex.handle && g_hudlessDevice == dev) dev->destroy_resource(g_hudlessTex), g_hudlessTex = {0};
     if (g_uiReadback.handle && g_hudlessDevice == dev) dev->destroy_resource(g_uiReadback), g_uiReadback = {0};
+    if (g_hudlessDevice == dev) DestroyMask(dev);
     if (!g_ready) return;
     g_ready = false;
     g_sl.shutdown();
@@ -615,13 +642,23 @@ struct __declspec(uuid("9a4e0c2b-6d1f-4b83-a5e7-2c8f1b0d3e74")) FgList {
     resource uiLayer = {0};  // last back-buffer-sized 8-bit render target bound on this list
 };
 
-enum class UiCheck { pending, reading, usable, unusable };
+enum class UiCheck { pending, reading, usable, inverted, unusable };
 UiCheck g_uiCheck = UiCheck::pending;
 uint64_t g_uiReadAt = 0;  // present count when the readback copy was recorded
 int g_uiTries = 0;
 std::atomic<uint64_t> g_uiCount{0};
 
 void OnInitList(command_list* cl) { cl->create_private_data<FgList>(); }
+
+void OnDestroyResource(device* dev, resource r) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (size_t i = 0; i < g_mask.srvs.size(); ++i)
+        if (g_mask.srvs[i].first == r.handle) {
+            dev->destroy_resource_view(g_mask.srvs[i].second);
+            g_mask.srvs.erase(g_mask.srvs.begin() + i);
+            return;
+        }
+}
 void OnDestroyList(command_list* cl) { cl->destroy_private_data<FgList>(); }
 void OnResetList(command_list* cl) {
     if (FgList* l = cl->get_private_data<FgList>()) l->uiLayer = {0};
@@ -676,7 +713,10 @@ void CheckUiRow() {
     g_hudlessDevice->unmap_buffer_region(g_uiReadback);
     if (zero == 64) {
         g_uiCheck = UiCheck::usable;
-        Log("frame generation: HUD layer alpha is 0 where there's no HUD: used as the UI buffer");
+        Log("frame generation: HUD layer alpha is 0 where there's no HUD: used as the HUD mask");
+    } else if (full == 64) {
+        g_uiCheck = UiCheck::inverted;
+        Log("frame generation: HUD layer alpha is 1 where there's no HUD (inverted): used as the HUD mask, flipped");
     } else if (++g_uiTries < 5) {
         g_uiCheck = UiCheck::pending;  // maybe HUD there right now: look again later
         Log("frame generation: HUD layer check %d: %d of 64 pixels transparent, %d opaque", g_uiTries, zero, full);
@@ -684,6 +724,74 @@ void CheckUiRow() {
         g_uiCheck = UiCheck::unusable;
         Log("frame generation: HUD layer alpha doesn't look like a UI mask (%d of 64 transparent): not used", zero);
     }
+}
+
+bool CreateMaskPipeline(device* dev) {
+    if (g_mask.pipe.handle) return true;
+    if (g_mask.failed) return false;
+    constant_range c = {};
+    c.count = 4;
+    c.visibility = shader_stage::all_compute;
+    descriptor_range srv = {};
+    srv.count = 1;
+    srv.visibility = shader_stage::all_compute;
+    srv.type = descriptor_type::shader_resource_view;
+    descriptor_range uav = {};
+    uav.count = 1;
+    uav.visibility = shader_stage::all_compute;
+    uav.type = descriptor_type::unordered_access_view;
+    const pipeline_layout_param params[3] = {pipeline_layout_param(c), pipeline_layout_param(srv), pipeline_layout_param(uav)};
+    shader_desc cs = {};
+    cs.code = kUiAlphaCs;
+    cs.code_size = sizeof(kUiAlphaCs);
+    pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+    const resource_desc d(g_bbWidth, g_bbHeight, 1, 1, format::r8_unorm, 1, memory_heap::default_,
+                          resource_usage::shader_resource | resource_usage::unordered_access);
+    if (!dev->create_pipeline_layout(3, params, &g_mask.layout) || !dev->create_pipeline(g_mask.layout, 1, &sub, &g_mask.pipe) ||
+        !dev->create_resource(d, nullptr, resource_usage::shader_resource, &g_mask.tex) ||
+        !dev->create_resource_view(g_mask.tex, resource_usage::unordered_access, resource_view_desc(format::r8_unorm), &g_mask.uav)) {
+        g_mask.failed = true;
+        Log("frame generation: couldn't create the HUD mask shader");
+        return false;
+    }
+    return true;
+}
+
+format UnormOf(format f) {
+    return f == format::b8g8r8a8_typeless ? format::b8g8r8a8_unorm : f == format::r8g8b8a8_typeless ? format::r8g8b8a8_unorm : f;
+}
+
+// Records the mask from the HUD layer (state render target) and puts the game's state back.
+bool RecordMask(command_list* cl, resource ui) {
+    device* dev = cl->get_device();
+    if (!CreateMaskPipeline(dev)) return false;
+    resource_view srv = {0};
+    for (const auto& [h, v] : g_mask.srvs)
+        if (h == ui.handle) srv = v;
+    if (!srv.handle) {
+        const format f = UnormOf(dev->get_resource_desc(ui).texture.format);
+        if (g_mask.srvs.size() >= 16 || !dev->create_resource_view(ui, resource_usage::shader_resource, resource_view_desc(f), &srv))
+            return false;
+        g_mask.srvs.push_back({ui.handle, srv});
+    }
+    const uint32_t params[4] = {g_bbWidth, g_bbHeight, g_uiCheck == UiCheck::inverted ? 1u : 0u, 0};
+    cl->barrier(ui, resource_usage::render_target, resource_usage::shader_resource);
+    cl->barrier(g_mask.tex, resource_usage::shader_resource, resource_usage::unordered_access);
+    cl->bind_pipeline(pipeline_stage::all_compute, g_mask.pipe);
+    cl->push_constants(shader_stage::all_compute, g_mask.layout, 0, 0, 4, params);
+    descriptor_table_update u = {};
+    u.count = 1;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = &srv;
+    cl->push_descriptors(shader_stage::all_compute, g_mask.layout, 1, u);
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = &g_mask.uav;
+    cl->push_descriptors(shader_stage::all_compute, g_mask.layout, 2, u);
+    cl->dispatch((g_bbWidth + 7) / 8, (g_bbHeight + 7) / 8, 1);
+    cl->barrier(g_mask.tex, resource_usage::unordered_access, resource_usage::shader_resource);
+    cl->barrier(ui, resource_usage::shader_resource, resource_usage::render_target);
+    RestoreListState(cl);
+    return true;
 }
 
 // UE's HDR output draws the HUD into separate layers, copies the finished scene out of the back
@@ -738,12 +846,11 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
     const resource ui = l ? l->uiLayer : resource{0};
     if (ui.handle) {
         if (g_uiCheck == UiCheck::pending && g_presents > 120) ReadUiRow(cl, ui);  // past the first frames
-        if (g_uiCheck == UiCheck::usable) {
-            // Streamline copies it now (the game blends it into the back buffer right after).
-            sl::Resource uiRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(ui.handle), nullptr, nullptr,
-                               D3D12_RESOURCE_STATE_RENDER_TARGET);
-            const sl::ResourceTag uiTag(&uiRes, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eOnlyValidNow, &extent);
-            if (g_sl.setTagForFrame(*token, sl::ViewportHandle(0), &uiTag, 1,
+        if ((g_uiCheck == UiCheck::usable || g_uiCheck == UiCheck::inverted) && RecordMask(cl, ui)) {
+            sl::Resource maskRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_mask.tex.handle), nullptr, nullptr,
+                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            const sl::ResourceTag maskTag(&maskRes, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent);
+            if (g_sl.setTagForFrame(*token, sl::ViewportHandle(0), &maskTag, 1,
                                     reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native())) == sl::Result::eOk)
                 ++g_uiCount;
         }
@@ -759,6 +866,7 @@ void OnInitSwapchain(swapchain* sc, bool) {
     if (g_hudlessTex.handle && (d.texture.width != g_bbWidth || d.texture.height != g_bbHeight || d.texture.format != g_bbFormat)) {
         g_hudlessDevice->destroy_resource(g_hudlessTex);  // resize: the game waits for the GPU first
         g_hudlessTex = {0};
+        DestroyMask(g_hudlessDevice);
     }
     g_bbWidth = d.texture.width, g_bbHeight = d.texture.height, g_bbFormat = d.texture.format;
 }
@@ -829,6 +937,7 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
     c.orthographicProjection = sl::Boolean::eFalse;
     c.motionVectorsDilated = sl::Boolean::eFalse;
     c.motionVectorsJittered = sl::Boolean::eFalse;
+    c.minRelativeLinearDepthObjectSeparation = g_set.separation;
     sl::Result r = g_sl.setConstants(c, *token, sl::ViewportHandle(0));
     if (r != sl::Result::eOk) {
         static int logged = 0;
@@ -864,6 +973,8 @@ void RegisterFrameGen() {
         g_set.mode = old ? k2x : kOff;
     }
     if (g_set.mode < kOff || g_set.mode >= kModeCount) g_set.mode = kOff;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "ObjectSeparation", g_set.separation);
+    if (!(g_set.separation >= 1 && g_set.separation <= 100)) g_set.separation = 40;
     g_set.enabled = g_set.mode != kOff;
     reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
@@ -871,6 +982,7 @@ void RegisterFrameGen() {
     reshade::register_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
     reshade::register_event<reshade::addon_event::copy_resource>(&OnCopyResource);
     reshade::register_event<reshade::addon_event::init_command_list>(&OnInitList);
+    reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
     reshade::register_event<reshade::addon_event::destroy_command_list>(&OnDestroyList);
     reshade::register_event<reshade::addon_event::reset_command_list>(&OnResetList);
     reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
@@ -883,6 +995,7 @@ void UnregisterFrameGen() {
     reshade::unregister_event<reshade::addon_event::destroy_swapchain>(&OnDestroySwapchain);
     reshade::unregister_event<reshade::addon_event::copy_resource>(&OnCopyResource);
     reshade::unregister_event<reshade::addon_event::init_command_list>(&OnInitList);
+    reshade::unregister_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
     reshade::unregister_event<reshade::addon_event::destroy_command_list>(&OnDestroyList);
     reshade::unregister_event<reshade::addon_event::reset_command_list>(&OnResetList);
     reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
@@ -924,11 +1037,20 @@ void DrawFrameGenOverlay() {
     ImGui::TextDisabled("Game frames %llu, with inputs %llu, with the picture before the HUD %llu",
                         static_cast<unsigned long long>(g_presents.load()), static_cast<unsigned long long>(g_tagged.load()),
                         static_cast<unsigned long long>(g_hudlessCount.load()));
-    ImGui::TextDisabled("HUD layer: %s (%llu frames)",
+    ImGui::TextDisabled("HUD mask: %s (%llu frames)",
                         g_uiCheck == UiCheck::usable     ? "used"
+                        : g_uiCheck == UiCheck::inverted ? "used (alpha flipped)"
                         : g_uiCheck == UiCheck::unusable ? "not usable"
                                                          : "checking",
                         static_cast<unsigned long long>(g_uiCount.load()));
+    float sep = g_set.separation;
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
+    if (ImGui::SliderFloat("Object separation", &sep, 1, 40, "%.0f")) g_set.separation = sep;
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        reshade::set_config_value(nullptr, RD_PRODUCT, "ObjectSeparation", g_set.separation);
+        Log("settings: object separation %.0f", g_set.separation);
+    }
+    ImGui::TextDisabled("How far apart in depth things must be to move separately: 40 = 4 m (NVIDIA's default), 10 = 1 m.");
 }
 
 }  // namespace rd

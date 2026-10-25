@@ -640,6 +640,10 @@ void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, c
 
 }  // namespace
 
+void RestoreListState(command_list* cl) {
+    if (ListState* s = State(cl)) Restore(cl, *s);
+}
+
 void RegisterUpscaler() {
     LoadSettings();
     reshade::register_event<reshade::addon_event::init_command_list>(&OnInitList);

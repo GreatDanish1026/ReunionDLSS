@@ -37,6 +37,9 @@ constexpr uint32_t kTsrResolveHistory = 0x60acc0c7;
 void RegisterUpscaler();
 void UnregisterUpscaler();
 void DrawUpscalerOverlay();
+// Puts the game's pipeline, root signatures, descriptor heaps and bindings back on <cl> after
+// the add-on recorded work of its own on it.
+void RestoreListState(reshade::api::command_list* cl);
 
 // framegen.cpp: DLSS Frame Generation through Streamline.
 void RegisterFrameGen();
