@@ -61,3 +61,12 @@ loaded before the swapchain exists. Streamline logs to `Win64\streamline\sl.log`
   ClipToPrevClip, ViewToTranslatedWorld at 256 (axes), camera position from RelativeWorldToClip
   (64) and TranslatedWorldToClip (0). Far plane 1e6 (UE's is infinite).
 - No hudless or UI buffers yet: the HUD will smear in generated frames.
+
+## Working (0.3.4, 2026-10-25)
+
+Confirmed in game: 2 frames presented per game frame, frame rate doubles. The key was creating
+the game's swapchain through Streamline's proxy factory (`slUpgradeInterface` on the factory the
+game called): DLSS-G sets itself up in its CreateSwapChain hooks, so upgrading an existing
+swapchain (0.3.0-0.3.3) left it on but presenting 0 extra frames.
+Known leftovers: a frame now and then has no tags (Streamline then reuses the last ones and logs
+an error); no hudless/UI buffers yet; Streamline warns that no backbuffer extent was tagged.
