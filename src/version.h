@@ -3,4 +3,4 @@
 
 #define RD_PRODUCT "ReunionDLSS"  // add-on name, log file name, ReShade.ini section
 #define RD_GAME "Life is Strange: Reunion"
-#define RD_VERSION "1.0.0"
+#define RD_VERSION "1.0.1"

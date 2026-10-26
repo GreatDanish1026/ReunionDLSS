@@ -285,13 +285,19 @@ struct CopyPool {
 std::recursive_mutex g_mutex;  // destroying resources can call back into OnDestroyResource
 CopyPool g_pool;
 
+// Linear colour formats DLSS takes. The game's scene colour is rgba16f with HDR output and
+// r11g11b10f with SDR output.
+bool IsHdrColor(format f) { return f == format::r16g16b16a16_float || f == format::r11g11b10_float; }
+
 // Copies <src> (in state <srcState>, format <want>) into a pool texture; {0} if the format isn't
-// the expected one (menus and other views bind other textures in these slots).
+// the expected one (menus and other views bind other textures in these slots). Wanting rgba16f
+// also takes r11g11b10f.
 resource CopyInput(command_list* cl, resource src, resource_usage srcState, format want, const char* what) {
     if (!src.handle) return {0};
     device* dev = cl->get_device();
     const resource_desc d = dev->get_resource_desc(src);
-    if (d.type != resource_type::texture_2d || d.texture.format != want) {
+    const bool ok = d.texture.format == want || (want == format::r16g16b16a16_float && IsHdrColor(d.texture.format));
+    if (d.type != resource_type::texture_2d || !ok) {
         static int logged = 0;
         if (logged < 20) {
             ++logged;
@@ -318,6 +324,14 @@ struct Link {
 std::map<uint64_t, Link> g_links;
 
 std::atomic<uint64_t> g_evaluated{0}, g_skipped{0};
+
+// Counts a view left to TSR, and logs each distinct reason the first few times.
+void Skip(const char* reason, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
+    ++g_skipped;
+    static std::map<std::string, int> logged;
+    int& n = logged[reason];
+    if (n++ < 3) Log("TSR kept for this view: %s (%u %u %u)", reason, a, b, c);
+}
 std::string g_error;
 std::map<uint64_t, bool> g_resetByOutput;  // per view
 // Render size per view: a new size (DLSS mode or menu change) starts DLSS and frame generation
@@ -568,18 +582,20 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     s.chain = Chain();  // used once
     const resource output = Bound(cl, s.compute, 1, 0);
     if (!output.handle || !chain.depth.handle || !chain.motion.handle || !chain.color.handle) {
-        ++g_skipped;
+        Skip("an input is missing (output, depth, motion, colour)", output.handle != 0, chain.depth.handle != 0,
+             (chain.motion.handle != 0) * 10 + (chain.color.handle != 0));
         return false;
     }
     const resource_desc out = dev->get_resource_desc(output);
-    if (out.texture.format != format::r11g11b10_float) {
-        ++g_skipped;
+    if (!IsHdrColor(out.texture.format)) {
+        Skip("TSR's output has an unexpected format (width, height, format)", out.texture.width, out.texture.height,
+             static_cast<uint32_t>(out.texture.format));
         return false;
     }
     float common[2] = {0, 0}, jitter[2] = {0, 0};
     if (!RenderSize(cl, s.compute, common) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2)) {
         g_error = "TSR parameters not readable";
-        ++g_skipped;
+        Skip("TSR's parameters aren't readable");
         return false;
     }
     const resource_desc cd = dev->get_resource_desc(chain.color);
@@ -587,7 +603,7 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     if (!rw || !rh || rw > cd.texture.width || rh > cd.texture.height || std::fabs(jitter[0]) > 0.5f ||
         std::fabs(jitter[1]) > 0.5f) {
         g_error = "TSR parameters out of range";
-        ++g_skipped;
+        Skip("TSR's parameters are out of range (render width, height, colour width)", rw, rh, cd.texture.width);
         return false;
     }
     std::string err;
