@@ -26,6 +26,13 @@ const std::wstring& ExeDir();
 uint32_t PipeId(reshade::api::pipeline pipe);
 
 // TSR's compute shaders in this game build (docs/FINDINGS.md).
+constexpr bool kTsrMapped = true;  // (framegen.cpp, shared with DoubleExposureDLSS, checks it)
+// Frame generation's inputs go to their frame when they're recorded (true) or when the game submits
+// them (false, DoubleExposureDLSS: UE 5.2). UE 5.6 submits on a thread of its own, so by submission
+// the next frame's work can come before this frame's Present: inputs then went to the wrong frame
+// (jitter around characters while the camera moved, 2026-10-31). Reunion's 1.0.x matched at
+// recording and was clean.
+constexpr bool kTagAtRecord = true;
 constexpr uint32_t kTsrDilateVelocity = 0xed32101f;
 constexpr uint32_t kTsrDecimateHistory = 0xdb4a2625;
 constexpr uint32_t kTsrRejectShading = 0xabcfcc34;
@@ -48,11 +55,14 @@ extern const ImVec4 kWarn;
 // the add-on recorded work of its own on it.
 void RestoreListState(reshade::api::command_list* cl);
 
-// framegen.cpp: DLSS Frame Generation through Streamline.
+// framegen.cpp: DLSS Frame Generation through Streamline, or FSR Frame Generation (fsrfg.cpp).
 void RegisterFrameGen();
 void UnregisterFrameGen();
 void DrawFrameGenSettings();
 void DrawFrameGenStatus();
+std::string FrameGenHeadline(bool* warn);
+std::string FrameGenDiag();
+bool FrameGenIsScreen(unsigned width, unsigned height);
 // The View uniform buffer (first 16 KB) of this frame's main view, with View.ClipToPrevClip's offset.
 void FrameGenSetCamera(const float* view, int clipToPrevClipOffset);
 // This frame's depth (UE's, state depth read + shader resource) and our motion vectors (render
