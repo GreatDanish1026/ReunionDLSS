@@ -232,6 +232,7 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from,
 // Back buffer size and format (ReShade's swapchain), and our copy of the picture before the HUD.
 uint32_t g_bbWidth = 0, g_bbHeight = 0;
 format g_bbFormat = format::unknown;
+swapchain* g_rsSwapchain = nullptr;  // ReShade's view of the game's swapchain (its colour space)
 resource g_hudlessTex = {0};
 resource g_uiReadback = {0};  // one row of the HUD layer, for its check
 device* g_hudlessDevice = nullptr;
@@ -401,10 +402,21 @@ void BeforePresentFsr() {
     ID3D12Resource* hud = g_hudless.Has(g_frame) && g_hudlessTex.handle ? reinterpret_cast<ID3D12Resource*>(g_hudlessTex.handle) : nullptr;
     ID3D12Resource* mask = hud && g_hudMask.Has(g_frame) && g_mask.tex.handle ? reinterpret_cast<ID3D12Resource*>(g_mask.tex.handle) : nullptr;
     CheckUiRow();  // the HUD layer's alpha check (inverted or not), for the mask
-    // UE only makes the picture before the HUD with HDR output: that's how HDR is told apart (UE's
-    // SDR back buffer is 10-bit too).
+    // HDR or SDR: the swapchain's colour space (UE's SDR back buffer is 10-bit too, so the format
+    // can't tell). Unknown: UE only makes the picture before the HUD with HDR output (not in every
+    // game: True Colors draws its HUD straight in).
+    bool hdr = g_hudlessCount > 0;
+    if (g_rsSwapchain) {
+        const color_space cs = g_rsSwapchain->get_color_space();
+        if (cs != color_space::unknown) hdr = cs == color_space::hdr10_pq || cs == color_space::hdr10_hlg || cs == color_space::scrgb;
+        static int lastCs = -1;
+        if (static_cast<int>(cs) != lastCs) {
+            lastCs = static_cast<int>(cs);
+            Log("frame generation: swapchain colour space %d (%s)", lastCs, hdr ? "HDR" : "SDR");
+        }
+    }
     fsrfg::BeforePresent(want, has ? &in : nullptr, hud, mask, g_set.fsrHud, g_bbWidth, g_bbHeight,
-                         static_cast<DXGI_FORMAT>(g_bbFormat), g_hudlessCount > 0);
+                         static_cast<DXGI_FORMAT>(g_bbFormat), hdr);
     const bool running = fsrfg::Running();
     if (running != g_fgOn) g_appliedMode = running ? k2x : kOff;
     g_fgOn = running;
@@ -1176,11 +1188,13 @@ void OnInitSwapchain(swapchain* sc, bool) {
         DestroyMask(g_hudlessDevice);
     }
     g_bbWidth = d.texture.width, g_bbHeight = d.texture.height, g_bbFormat = d.texture.format;
+    g_rsSwapchain = sc;
 }
 
-void OnDestroySwapchain(swapchain*, bool) {
+void OnDestroySwapchain(swapchain* sc, bool) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     g_bbWidth = 0;  // no pre-HUD copies until the swapchain is back
+    if (g_rsSwapchain == sc) g_rsSwapchain = nullptr;
 }
 
 }  // namespace
